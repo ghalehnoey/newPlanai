@@ -1,0 +1,21 @@
+{
+  "name": "وکیل هوش مصنوعی",
+  "short_name": "AI Lawyer",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0e0c2d",
+  "theme_color": "#8b5cf6",
+  "description": "دستیار هوش مصنوعی حقوقی با قابلیت ارائه مشاوره حرفه‌ای بر اساس قوانین ایران.",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ]
+}

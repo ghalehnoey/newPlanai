@@ -1,0 +1,446 @@
+<?php
+
+namespace App\Services;
+
+use GuzzleHttp\Client;
+use RuntimeException;
+use Throwable;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
+use App\Models\AiModel;
+
+class AiApiService
+{
+    public function __construct(private FileService $fileService) {}
+
+    // ============ کانفیگ ============
+    private function getModelConfig(string $modelKey): AiModel
+    {
+        $model = AiModel::where('key', $modelKey)->where('is_active', true)->first();
+        if (!$model) {
+            throw new RuntimeException("مدل {$modelKey} فعال یا تعریف نشده است.");
+        }
+        return $model;
+    }
+
+    private function getProviderConfigByModel(AiModel $model): array
+    {
+        $apiKey = $model->api_key ?: match($model->provider) {
+            'irangpu' => config('services.irangpu.key'),
+            'gapgpt'  => config('services.gapgpt.key'),
+            'deepseek'=> config('services.deepseek.key'),
+            default   => null,
+        };
+
+        return [
+            'base_url' => $model->endpoint,
+            'api_key'  => $apiKey,
+        ];
+    }
+
+    private function resolveModel(AiModel $model): string
+    {
+        return $model->model_mapping;
+    }
+
+    private function headers(string $apiKey): array
+    {
+        return [
+            'Content-Type'  => 'application/json',
+            'Authorization' => 'Bearer ' . $apiKey,
+        ];
+    }
+
+    // ============ کلاینت سادهٔ Guzzle (بدون پراکسی) ============
+    private function client(int $timeout = 150): Client
+    {
+        return new Client(['timeout' => $timeout]);
+    }
+
+    // ============ متد تشخیص نیاز به پراکسی ============
+    private function requiresProxy(AiModel $model): bool
+    {
+        return strtolower($model->key) === 'chatgpt-5.5' || strtolower($model->provider) === 'openai';
+    }
+
+    // ============ ارسال درخواست به سرویس پروکسی داخلی (فقط برای OpenAI) ============
+    private function proxyRequest(string $apiKey, string $baseUrl, array $body): string
+    {
+        Log::info('📤 Sending to proxy microservice', [
+            'url'     => $baseUrl,
+            'headers' => ['Authorization' => 'Bearer ' . $apiKey],
+            'body'    => $body,
+        ]);
+
+        $client = new Client(['timeout' => 0]);
+        $response = $client->post('http://127.0.0.1:8081/proxy', [
+            'json' => [
+                'url'     => $baseUrl,
+                'headers' => ['Authorization' => 'Bearer ' . $apiKey],
+                'body'    => $body,
+            ]
+        ]);
+
+        $contents = $response->getBody()->getContents();
+        Log::info('📥 Raw response from proxy', ['response' => $contents]);
+
+        $data = json_decode($contents, true);
+
+        if (isset($data['error'])) {
+            throw new RuntimeException("Proxy service error: " . $data['error']);
+        }
+
+        // بررسی خطاهای OpenAI (پاسخ شامل کلید error)
+        if (isset($data['error']['message'])) {
+            throw new RuntimeException("OpenAI error: " . $data['error']['message']);
+        }
+
+        return $data['choices'][0]['message']['content'] ?? '';
+    }
+
+    // ============ زنجیرهٔ مدل‌ها ============
+    private function getModelChain(string $primaryModelKey, bool $needsFiles = false): array
+    {
+        $chain = [];
+        $seen = [];
+
+        try {
+            $primary = $this->getModelConfig($primaryModelKey);
+            $chain[] = $primary;
+            $seen[] = $primary->key;
+        } catch (RuntimeException $e) {
+            Log::warning('Primary model unavailable', [
+                'model' => $primaryModelKey,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        $query = AiModel::where('is_active', true)
+            ->where('key', '!=', $primaryModelKey);
+
+        if ($needsFiles) {
+            $query->where('supports_files', true);
+        }
+
+        if (Schema::hasColumn('ai_models', 'sort_order')) {
+            $query->orderBy('sort_order', 'asc');
+        } else {
+            $query->orderBy('id', 'asc');
+        }
+
+        foreach ($query->get() as $fb) {
+            if (!in_array($fb->key, $seen, true)) {
+                $chain[] = $fb;
+                $seen[] = $fb->key;
+            }
+        }
+
+        if (empty($chain)) {
+            throw new RuntimeException('هیچ مدل فعالی برای پاسخ‌گویی موجود نیست.');
+        }
+
+        return $chain;
+    }
+
+    // ============ ساخت پیام‌ها ============
+    private function buildMessagesWithFiles(
+        string $systemPrompt,
+        array $history,
+        string $message,
+        array $uploadedFiles = []
+    ): array {
+        $messages = [['role' => 'system', 'content' => $systemPrompt]];
+
+        foreach ($history as $m) {
+            if (empty($m['content'] ?? '')) continue;
+            $messages[] = ['role' => $m['role'], 'content' => $m['content']];
+        }
+
+        $userContent = [];
+        if (trim($message) !== '') {
+            $userContent[] = ['type' => 'text', 'text' => trim($message)];
+        }
+
+        foreach ($uploadedFiles as $fileModel) {
+            $fullPath = storage_path('app/public/' . $fileModel->path);
+            if (!file_exists($fullPath)) {
+                Log::error('File not found', ['path' => $fileModel->path]);
+                continue;
+            }
+
+            $mime = strtolower($fileModel->mime_type ?? '');
+            if (empty($mime)) {
+                $mime = mime_content_type($fullPath) ?: 'application/octet-stream';
+            }
+
+            if (str_starts_with($mime, 'image/')) {
+                $base64 = base64_encode(file_get_contents($fullPath));
+                $userContent[] = [
+                    'type'      => 'image_url',
+                    'image_url' => ['url' => "data:{$mime};base64,{$base64}"],
+                ];
+            } else {
+                try {
+                    $extractedText = $this->fileService->extractText($fullPath, $mime);
+                    $fileName = $fileModel->original_name ?? 'فایل';
+                    $userContent[] = [
+                        'type' => 'text',
+                        'text' => "\n\n--- محتوای فایل {$fileName} ---\n{$extractedText}\n------------------\n",
+                    ];
+                } catch (\Exception $e) {
+                    Log::error('Text extraction failed', ['error' => $e->getMessage()]);
+                }
+            }
+        }
+
+        $messages[] = ['role' => 'user', 'content' => $userContent];
+        return $messages;
+    }
+
+    private function buildMessages(string $systemPrompt, array $history, string $message): array
+    {
+        $messages = [['role' => 'system', 'content' => $systemPrompt]];
+        foreach ($history as $m) {
+            if (empty($m['content'] ?? '')) continue;
+            $messages[] = ['role' => $m['role'], 'content' => $m['content']];
+        }
+        $messages[] = ['role' => 'user', 'content' => trim($message)];
+        return $messages;
+    }
+
+    // ============ تماس غیر استریم با Fallback ============
+    public function callWithHistory(
+        string $message,
+        string $model,
+        string $systemPrompt,
+        array $previousChatMessages = [],
+        array $uploadedFiles = []
+    ): string {
+        $history = $this->normalizeHistory($previousChatMessages);
+        $needsFiles = !empty($uploadedFiles);
+        $chain = $this->getModelChain($model, $needsFiles);
+        $errors = [];
+
+        foreach ($chain as $modelConfig) {
+            try {
+                $provider = $this->getProviderConfigByModel($modelConfig);
+                if (!$provider['api_key']) {
+                    throw new RuntimeException("کلید API برای مدل {$modelConfig->key} تنظیم نشده است.");
+                }
+
+                $messages = ($needsFiles && $modelConfig->supports_files)
+                    ? $this->buildMessagesWithFiles($systemPrompt, $history, $message, $uploadedFiles)
+                    : $this->buildMessages($systemPrompt, $history, $message);
+
+                $body = [
+                    'model'       => $this->resolveModel($modelConfig),
+                    'messages'    => $messages,
+                    'temperature' => 0.7,
+                ];
+
+                // تنظیم توکن بر اساس نیاز به پراکسی
+                if ($this->requiresProxy($modelConfig)) {
+                    $body['max_completion_tokens'] = 4000;
+                } else {
+                    $body['max_tokens'] = 4000;
+                }
+
+                if ($this->requiresProxy($modelConfig)) {
+                    Log::info('🔁 Using proxy service for sync request', ['model' => $modelConfig->key]);
+                    $content = $this->proxyRequest(
+                        $provider['api_key'],
+                        $provider['base_url'],
+                        $body
+                    );
+                } else {
+                    $response = $this->client()->post($provider['base_url'], [
+                        'headers' => $this->headers($provider['api_key']),
+                        'json'    => $body,
+                    ]);
+                    $data = json_decode($response->getBody()->getContents(), true);
+                    $content = $data['choices'][0]['message']['content'] ?? '';
+                }
+
+                if (trim((string) $content) === '') {
+                    throw new RuntimeException("پاسخ خالی از مدل {$modelConfig->key}");
+                }
+
+                if ($modelConfig->key !== $model) {
+                    Log::info('Fallback model used (sync)', [
+                        'requested' => $model,
+                        'used'      => $modelConfig->key,
+                        'errors'    => $errors,
+                    ]);
+                }
+
+                return $content;
+
+            } catch (Throwable $e) {
+                $errors[$modelConfig->key] = $e->getMessage();
+                Log::warning('Sync attempt failed', [
+                    'model' => $modelConfig->key,
+                    'error' => $e->getMessage(),
+                ]);
+                continue;
+            }
+        }
+
+        Log::error('All AI models failed (sync)', ['errors' => $errors]);
+        return 'متأسفانه در حال حاضر امکان پاسخ‌گویی وجود ندارد. لطفاً چند لحظه بعد دوباره تلاش کنید.';
+    }
+
+    // ============ استریم با Fallback ============
+    public function stream(
+        string $question,
+        string $model,
+        string $systemPrompt,
+        array $previousChatMessages = [],
+        array $uploadedFiles = [],
+        callable $onChunk = null
+    ): void {
+        $history = $this->normalizeHistory($previousChatMessages);
+        $needsFiles = !empty($uploadedFiles);
+        $chain = $this->getModelChain($model, $needsFiles);
+        $errors = [];
+        $hasStarted = false;
+
+        foreach ($chain as $modelConfig) {
+            if ($hasStarted) break;
+
+            try {
+                $provider = $this->getProviderConfigByModel($modelConfig);
+                if (!$provider['api_key']) {
+                    throw new RuntimeException("کلید API برای مدل {$modelConfig->key} موجود نیست.");
+                }
+
+                $messages = ($needsFiles && $modelConfig->supports_files)
+                    ? $this->buildMessagesWithFiles($systemPrompt, $history, $question, $uploadedFiles)
+                    : $this->buildMessages($systemPrompt, $history, $question);
+
+                $body = [
+                    'model'       => $this->resolveModel($modelConfig),
+                    'messages'    => $messages,
+                    'temperature' => 0.7,
+                ];
+
+                if ($this->requiresProxy($modelConfig)) {
+                    // برای مدل‌های OpenAI (پراکسی) از max_completion_tokens استفاده کن
+                    $body['max_completion_tokens'] = 4000;
+                    $body['stream'] = false; // ارسال غیر استریم از طریق سرویس پروکسی
+
+                    Log::info('🔁 Proxy required – delegating to proxy microservice', [
+                        'model' => $modelConfig->key,
+                        'body'  => $body,
+                    ]);
+
+                    $content = $this->proxyRequest(
+                        $provider['api_key'],
+                        $provider['base_url'],
+                        $body
+                    );
+
+                    if (trim((string)$content) === '') {
+                        throw new RuntimeException("پاسخ خالی از سرویس پروکسی");
+                    }
+
+                    if ($onChunk) {
+                        $onChunk($content);
+                    }
+                    $hasStarted = true;
+
+                    if ($modelConfig->key !== $model) {
+                        Log::info('Stream fallback used (via proxy)', [
+                            'requested' => $model,
+                            'used'      => $modelConfig->key,
+                            'errors'    => $errors,
+                        ]);
+                    }
+                    return;
+                }
+
+                // --- استریم عادی برای مدل‌های بدون پراکسی ---
+                $body['max_tokens'] = 4000;
+                $body['stream'] = true;
+
+                $client = new Client([
+                    'timeout'         => 0,
+                    'connect_timeout' => 15,
+                ]);
+
+                $response = $client->post($provider['base_url'], [
+                    'headers' => $this->headers($provider['api_key']),
+                    'json'    => $body,
+                    'stream'  => true,
+                ]);
+
+                $bodyStream = $response->getBody();
+                $buffer = '';
+
+                while (!$bodyStream->eof()) {
+                    $buffer .= $bodyStream->read(8192);
+                    while (($pos = strpos($buffer, "\n")) !== false) {
+                        $line = trim(substr($buffer, 0, $pos));
+                        $buffer = substr($buffer, $pos + 1);
+                        if ($line === '' || $line === 'data: [DONE]') continue;
+                        if (str_starts_with($line, 'data: ')) {
+                            $json = substr($line, 6);
+                            $data = json_decode($json, true);
+                            if (isset($data['choices'][0]['delta']['content'])) {
+                                $chunk = (string) $data['choices'][0]['delta']['content'];
+                                if ($chunk !== '') {
+                                    $hasStarted = true;
+                                    if ($onChunk) $onChunk($chunk);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if ($hasStarted && $modelConfig->key !== $model) {
+                    Log::info('Stream fallback used', [
+                        'requested' => $model,
+                        'used'      => $modelConfig->key,
+                        'errors'    => $errors,
+                    ]);
+                }
+                return;
+
+            } catch (Throwable $e) {
+                $errors[$modelConfig->key] = $e->getMessage();
+                Log::warning('Stream attempt failed', [
+                    'model'       => $modelConfig->key,
+                    'has_started' => $hasStarted,
+                    'error'       => $e->getMessage(),
+                ]);
+
+                if ($hasStarted) {
+                    return;
+                }
+                continue;
+            }
+        }
+
+        Log::error('All stream models failed', ['errors' => $errors]);
+    }
+
+    private function normalizeHistory(array $messages): array
+    {
+        $out = [];
+        foreach ($messages as $m) {
+            if (!is_array($m)) continue;
+            $role = $m['role'] ?? null;
+            $content = trim((string) ($m['content'] ?? ''));
+            if ($content === '' || !in_array($role, ['user', 'assistant'], true)) {
+                continue;
+            }
+            $out[] = ['role' => $role, 'content' => $content];
+        }
+        return $out;
+    }
+
+    public function supportsFiles(string $modelKey): bool
+    {
+        $model = AiModel::where('key', $modelKey)->first();
+        return $model ? $model->supports_files : false;
+    }
+}

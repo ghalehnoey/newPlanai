@@ -1,0 +1,91 @@
+:root { color-scheme: light; }
+
+body {
+    font-family: 'Vazirmatn', sans-serif;
+    background: radial-gradient(circle at top, #eef2ff 0, #f9fafb 40%, #e5e7eb 100%);
+    color: #0f172a;
+    overflow: hidden;
+    min-height: 100vh;
+    position: relative;
+}
+
+body::before, body::after {
+    content: "";
+    position: fixed;
+    width: 420px;
+    height: 420px;
+    border-radius: 999px;
+    filter: blur(60px);
+    opacity: 0.45;
+    z-index: -1;
+    pointer-events: none;
+}
+
+body::before {
+    background: radial-gradient(circle, #c4b5fd, #a5b4fc);
+    top: -140px;
+    left: -80px;
+}
+
+body::after {
+    background: radial-gradient(circle, #a7f3d0, #bfdbfe);
+    bottom: -160px;
+    right: -60px;
+}
+
+.markdown-body code {
+    background: rgba(148,163,184,.18);
+    padding: 3px 6px;
+    border-radius: 6px;
+    font-size: 0.85em;
+}
+
+.markdown-body pre {
+    background: #0f172a;
+    color: #f9fafb;
+    padding: 1rem;
+    border-radius: 12px;
+    overflow-x: auto;
+}
+
+.modelBtn.active {
+    background: linear-gradient(90deg,#6366f1,#8b5cf6) !important;
+    color: white !important;
+    box-shadow: 0 6px 20px rgba(129,140,248,.55);
+}
+
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+#chatBox {
+    scrollbar-gutter: stable;
+    scroll-behavior: smooth;
+}
+
+.typing-indicator {
+    display: flex;
+    gap: 5px;
+    align-items: center;
+}
+
+.typing-indicator span {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background-color: #94a3b8;
+    display: inline-block;
+    animation: typingBounce 1.4s infinite ease-in-out;
+}
+
+.typing-indicator span:nth-child(1) { animation-delay: 0s; }
+.typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+.typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes typingBounce {
+    0%,100% { transform: translateY(0); opacity: .5;}
+    50% { transform: translateY(-10px); opacity: 1;}
+}
+
+@media (max-width: 1024px) {
+    body { overflow: auto; }
+}

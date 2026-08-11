@@ -1,0 +1,250 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\User;
+use App\Models\Plan;
+use App\Models\Subscription;
+use App\Models\AiModel;
+use App\Models\Conversation;
+use App\Models\Message;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Hash;
+use Carbon\Carbon;
+
+class AdminController extends Controller
+{
+    public function dashboard(Request $request)
+    {
+        $search = $request->input('search');
+        $status = $request->input('status', 'all');
+        $role   = $request->input('role');
+
+        $query = User::with('activeSubscription.plan')->latest();
+
+        if ($search) {
+            $query->where(function ($q) use ($search) {
+                $q->where('name', 'like', "%{$search}%")
+                  ->orWhere('email', 'like', "%{$search}%")
+                  ->orWhere('phone', 'like', "%{$search}%");
+            });
+        }
+
+        if ($status === 'active') {
+            $query->whereHas('subscriptions', fn($q) => $q->where('expires_at', '>', now()));
+        } elseif ($status === 'expired') {
+            $query->whereHas('subscriptions', fn($q) => $q->where('expires_at', '<=', now()));
+        } elseif ($status === 'none') {
+            $query->doesntHave('subscriptions');
+        }
+
+        if ($role) {
+            $query->where('role', $role);
+        }
+
+        $users = $query->paginate(20)->appends($request->only(['search', 'status', 'role']));
+
+        $stats = [
+            'totalUsers'           => User::count(),
+            'activeSubscriptions'  => Subscription::where('expires_at', '>', now())->count(),
+            'expiredSubscriptions' => Subscription::where('expires_at', '<=', now())->count(),
+            'noSubscriptionUsers'  => User::doesntHave('subscriptions')->count(),
+            'totalConversations'   => Conversation::count(),
+            'totalMessages'        => Message::count(),
+            'newUsersToday'        => User::whereDate('created_at', today())->count(),
+            'newUsersThisMonth'    => User::whereMonth('created_at', now()->month)->count(),
+        ];
+
+        $plans = Plan::orderBy('price')->get();
+
+        return view('admin.dashboard', compact('users', 'stats', 'plans', 'search', 'status', 'role'));
+    }
+
+    public function changePassword(Request $request, User $user)
+    {
+        $request->validate(['password' => 'required|string|min:6']);
+        $user->update(['password' => Hash::make($request->password)]);
+        return back()->with('success', 'رمز عبور با موفقیت تغییر کرد.');
+    }
+
+    public function updatePhone(Request $request, User $user)
+    {
+        $request->validate(['phone' => 'required|string|unique:users,phone,' . $user->id]);
+        $user->update(['phone' => $request->phone]);
+        return back()->with('success', 'شماره تماس بروزرسانی شد.');
+    }
+
+    public function updateRole(Request $request, User $user)
+    {
+        if (auth()->user()->role !== 'manager') {
+            abort(403, 'فقط مدیر کل می‌تواند نقش تغییر دهد');
+        }
+        $request->validate(['role' => 'required|in:user,manager,modir2']);
+        $user->update(['role' => $request->role, 'is_admin' => $request->role === 'manager']);
+        return back()->with('success', 'نقش کاربر تغییر کرد.');
+    }
+
+    public function updateSubscription(Request $request, User $user)
+    {
+        $request->validate([
+            'plan_id'         => 'required|exists:plans,id',
+            'expires_at'      => 'required|date',
+            'questions_used'  => 'required|integer|min:0',
+        ]);
+
+        $subscription = $user->activeSubscription ?? $user->subscriptions()->latest()->first();
+
+        if ($subscription) {
+            $subscription->update([
+                'plan_id'        => $request->plan_id,
+                'expires_at'     => Carbon::parse($request->expires_at),
+                'questions_used' => $request->questions_used,
+                'paid'           => 1,
+            ]);
+        } else {
+            Subscription::create([
+                'user_id'        => $user->id,
+                'plan_id'        => $request->plan_id,
+                'expires_at'     => Carbon::parse($request->expires_at),
+                'questions_used' => $request->questions_used,
+                'paid'           => 1,
+            ]);
+        }
+
+        return back()->with('success', 'اشتراک کاربر بروزرسانی شد.');
+    }
+
+    public function bulkExtendSubscriptions(Request $request)
+    {
+        $request->validate(['days' => 'required|integer']);
+        $days = (int) $request->days;
+        $subs = Subscription::where('expires_at', '>', now())->get();
+        foreach ($subs as $sub) {
+            $sub->update(['expires_at' => Carbon::parse($sub->expires_at)->addDays($days)]);
+        }
+        $action = $days > 0 ? 'افزایش' : 'کاهش';
+        return back()->with('success', "زمان اشتراک {$subs->count()} کاربر {$action} یافت.");
+    }
+
+    public function createUser(Request $request)
+    {
+        $request->validate([
+            'name'     => 'required|string|max:255',
+            'phone'    => 'required|string|unique:users,phone',
+            'email'    => 'nullable|email|unique:users,email',
+            'password' => 'required|string|min:6',
+            'role'     => 'in:user,manager,modir2',
+        ]);
+
+        User::create([
+            'name'           => $request->name,
+            'phone'          => $request->phone,
+            'email'          => $request->email,
+            'password'       => Hash::make($request->password),
+            'role'           => $request->role ?? 'user',
+            'is_admin'       => $request->role === 'manager',
+            'phone_verified' => true,
+        ]);
+
+        return back()->with('success', 'کاربر جدید ایجاد شد.');
+    }
+
+    public function deleteUser(User $user)
+    {
+        if (auth()->user()->role !== 'manager') {
+            abort(403);
+        }
+        if ($user->id === auth()->id()) {
+            return back()->with('error', 'نمی‌توانید حساب خودتان را حذف کنید.');
+        }
+        $user->delete();
+        return back()->with('success', 'کاربر حذف شد.');
+    }
+
+    /* ═══════════════ AI MODELS (manager only) ═══════════════ */
+
+    public function aiModelsIndex()
+    {
+        $models = AiModel::orderBy('sort_order')->get();
+        return view('admin.ai_models.index', compact('models'));
+    }
+
+    public function aiModelsCreate()
+    {
+        return view('admin.ai_models.create');
+    }
+
+    public function aiModelsStore(Request $request)
+    {
+        $validated = $request->validate([
+            'key'            => 'required|string|unique:ai_models,key',
+            'name'           => 'required|string|max:255',
+            'title'          => 'nullable|string|max:255',
+            'provider'       => 'required|string|in:gapgpt,irangpu,deepseek,openai,custom',
+            'endpoint'       => 'required|url',
+            'api_key'        => 'nullable|string',
+            'model_mapping'  => 'required|string|max:255',
+            'supports_files' => 'boolean',
+            'is_active'      => 'boolean',
+            'sort_order'     => 'integer',
+        ]);
+
+        $validated['supports_files'] = $request->has('supports_files');
+        $validated['is_active']      = $request->has('is_active');
+
+        AiModel::create($validated);
+        return redirect()->route('admin.ai-models.index')->with('success', 'مدل جدید اضافه شد.');
+    }
+
+    public function aiModelsEdit(AiModel $aiModel)
+    {
+        return view('admin.ai_models.edit', compact('aiModel'));
+    }
+
+    public function aiModelsUpdate(Request $request, AiModel $aiModel)
+    {
+        $validated = $request->validate([
+            'name'           => 'required|string|max:255',
+            'title'          => 'nullable|string|max:255',
+            'endpoint'       => 'required|url',
+            'api_key'        => 'nullable|string',
+            'model_mapping'  => 'required|string|max:255',
+            'supports_files' => 'boolean',
+            'is_active'      => 'boolean',
+            'sort_order'     => 'integer',
+        ]);
+
+        $validated['supports_files'] = $request->has('supports_files');
+        $validated['is_active']      = $request->has('is_active');
+
+        if (empty($validated['api_key'])) {
+            unset($validated['api_key']);
+        }
+
+        $aiModel->update($validated);
+        return redirect()->route('admin.ai-models.index')->with('success', 'مدل بروزرسانی شد.');
+    }
+
+    public function aiModelsDestroy(AiModel $aiModel)
+    {
+        $aiModel->delete();
+        return redirect()->route('admin.ai-models.index')->with('success', 'مدل حذف شد.');
+    }
+
+    public function stats()
+    {
+        $data = [
+            'usersByMonth'   => User::selectRaw('MONTH(created_at) as m, COUNT(*) as cnt')
+                ->whereYear('created_at', now()->year)->groupBy('m')->orderBy('m')->get(),
+            'messagesByDay'  => Message::selectRaw('DATE(created_at) as d, COUNT(*) as cnt')
+                ->where('created_at', '>=', now()->subDays(30))->groupBy('d')->orderBy('d')->get(),
+            'topPlan'        => Plan::withCount('subscriptions')->orderByDesc('subscriptions_count')->first(),
+        ];
+        return view('admin.stats', compact('data'));
+    }
+
+    public function systemSettings()
+    {
+        return view('admin.system');
+    }
+}

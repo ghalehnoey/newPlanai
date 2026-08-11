@@ -1,0 +1,381 @@
+// ==================== متغیرهای سراسری ====================
+let currentModel = null;
+let currentModelSupportsFiles = false;
+let currentConversationId = null;
+let isFirstAssistantMessage = true;
+let shouldAutoScroll = true;
+let selectedFiles = [];
+
+// DOM elements
+const chatBox = document.getElementById('chatBox');
+const questionInput = document.getElementById('question');
+const sendBtn = document.getElementById('sendBtn');
+const fileInput = document.getElementById('fileInput');
+const fileInputBtn = document.getElementById('fileInputBtn');
+const fileUploadContainer = document.getElementById('fileUploadContainer');
+const filePreviewContainer = document.getElementById('filePreviewContainer');
+const fileNameDisplay = document.getElementById('fileNameDisplay');
+const removeFileBtn = document.getElementById('removeFileBtn');
+const chatMain = document.getElementById('chatMain');
+
+// ==================== توابع کمکی ====================
+function updateFileUI() {
+    if (selectedFiles.length > 0) {
+        filePreviewContainer.classList.remove('hidden');
+        fileNameDisplay.textContent = selectedFiles.length === 1 ? selectedFiles[0].name : `${selectedFiles.length} فایل`;
+        if (fileInputBtn) fileInputBtn.classList.add('bg-indigo-100', 'text-indigo-600');
+    } else {
+        filePreviewContainer.classList.add('hidden');
+        if (fileInputBtn) fileInputBtn.classList.remove('bg-indigo-100', 'text-indigo-600');
+        if (fileInput) fileInput.value = '';
+    }
+}
+
+function selectModel(modelKey, supportsFiles) {
+    currentModel = modelKey;
+    currentModelSupportsFiles = supportsFiles === 'true' || supportsFiles === true;
+    
+    // به‌روزرسانی استایل دکمه‌ها
+    document.querySelectorAll('.model-btn').forEach(btn => {
+        if (btn.dataset.model === modelKey) {
+            btn.classList.remove('bg-slate-100', 'text-slate-700', 'hover:bg-slate-200');
+            btn.classList.add('bg-indigo-500', 'text-white', 'shadow-md');
+        } else {
+            btn.classList.remove('bg-indigo-500', 'text-white', 'shadow-md');
+            btn.classList.add('bg-slate-100', 'text-slate-700', 'hover:bg-slate-200');
+        }
+    });
+    
+    // نمایش یا مخفی کردن دکمه آپلود فایل
+    if (fileUploadContainer) {
+        if (currentModelSupportsFiles) {
+            fileUploadContainer.classList.remove('hidden');
+            console.log('✅ فایل آپلود فعال شد برای مدل:', currentModel);
+        } else {
+            fileUploadContainer.classList.add('hidden');
+            // اگر مدل از فایل پشتیبانی نمی‌کند، فایل‌های انتخاب شده را پاک کن
+            if (selectedFiles.length > 0) {
+                selectedFiles = [];
+                updateFileUI();
+            }
+        }
+    }
+    
+    console.log('✅ مدل انتخاب شد:', currentModel, '| پشتیبانی از فایل:', currentModelSupportsFiles);
+}
+
+function scrollChat(force = false) {
+    if (force || shouldAutoScroll) {
+        if (chatMain) chatMain.scrollTop = chatMain.scrollHeight;
+    }
+}
+
+function escapeHtml(text) {
+    if (!text) return '';
+    return text.replace(/[&<>]/g, function(m) {
+        if (m === '&') return '&amp;';
+        if (m === '<') return '&lt;';
+        if (m === '>') return '&gt;';
+        return m;
+    }).replace(/\n/g, '<br>');
+}
+
+// ==================== رندر پیام‌ها ====================
+function addUserMessage(text, filesData = []) {
+    let filesHtml = '';
+    if (filesData.length > 0) {
+        filesHtml = '<div class="flex flex-wrap gap-2 justify-end mb-2">';
+        filesData.forEach(f => {
+            if (f.isImage) {
+                filesHtml += `<img src="${f.url}" class="max-w-[100px] max-h-[100px] rounded-xl border border-indigo-200 object-cover">`;
+            } else {
+                filesHtml += `<div class="bg-white px-3 py-1.5 rounded-full text-xs shadow-sm border border-slate-200">📄 ${escapeHtml(f.name)}</div>`;
+            }
+        });
+        filesHtml += '</div>';
+    }
+    
+    chatBox.innerHTML += `
+        <div class="flex justify-end">
+            <div class="max-w-[85%] bg-indigo-50 text-slate-800 rounded-2xl px-4 py-2.5 shadow-sm">
+                ${filesHtml}
+                ${text ? `<div class="whitespace-pre-wrap break-words text-sm">${escapeHtml(text)}</div>` : ''}
+            </div>
+        </div>
+    `;
+    scrollChat(true);
+}
+
+function addAiTyping() {
+    const id = 'ai-typing-' + Date.now();
+    chatBox.innerHTML += `
+        <div class="flex justify-start" id="${id}">
+            <div class="bg-white border border-slate-200 rounded-2xl px-4 py-2.5 shadow-sm flex items-center gap-2">
+                <div class="flex gap-1">
+                    <span class="w-2 h-2 bg-slate-400 rounded-full animate-bounce"></span>
+                    <span class="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style="animation-delay: 0.1s"></span>
+                    <span class="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style="animation-delay: 0.2s"></span>
+                </div>
+                <span class="text-xs text-slate-500">در حال پاسخگویی...</span>
+            </div>
+        </div>
+    `;
+    scrollChat(true);
+    return id;
+}
+
+function renderAssistantMessage(containerId, content) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    
+    const firstHeader = '<div class="text-xs text-amber-800 bg-amber-50 rounded-xl p-3 mb-3">⚠️ این متن توسط هوش مصنوعی تولید شده و نیاز به بررسی دارد.</div>';
+    const footer = '<div class="text-[10px] text-slate-400 mt-3 pt-2 border-t border-slate-100">🤖 تولید شده توسط هوش مصنوعی</div>';
+    
+    let html = isFirstAssistantMessage ? firstHeader : '';
+    html += marked.parse(content || '');
+    html += footer;
+    
+    container.innerHTML = `<div class="bg-white border border-slate-200 rounded-2xl px-4 py-2.5 shadow-sm prose prose-sm max-w-full">${html}</div>`;
+    scrollChat();
+}
+
+// ==================== ارسال پیام با استریم ====================
+async function sendMessage() {
+    if (!currentModel) {
+        alert('لطفاً یک مدل انتخاب کنید.');
+        return;
+    }
+    
+    const text = questionInput.value.trim();
+    if (!text && selectedFiles.length === 0) return;
+    
+    // نمایش پیام کاربر
+    const tempFiles = selectedFiles.map(f => ({
+        url: URL.createObjectURL(f),
+        name: f.name,
+        isImage: f.type.startsWith('image/')
+    }));
+    addUserMessage(text, tempFiles);
+    
+    // پاک کردن فرم
+    questionInput.value = '';
+    questionInput.style.height = 'auto';
+    const filesToSend = [...selectedFiles];
+    selectedFiles = [];
+    updateFileUI();
+    
+    // نمایش تایپینگ
+    const typingId = addAiTyping();
+    await new Promise(r => setTimeout(r, 50));
+    
+    // آماده‌سازی FormData
+    const formData = new FormData();
+    formData.append('question', text);
+    formData.append('model', currentModel);
+    if (filesToSend.length && currentModelSupportsFiles) {
+        filesToSend.forEach(f => formData.append('files[]', f));
+    }
+    if (currentConversationId) formData.append('conversation_id', currentConversationId);
+    
+    try {
+        const response = await fetch('/chat/send', {
+            method: 'POST',
+            headers: {
+                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content || '',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            body: formData
+        });
+        
+        if (!response.ok) {
+            let errorData = await response.json().catch(() => ({}));
+            renderAssistantMessage(typingId, errorData.error || '❌ خطا در ارتباط با سرور');
+            return;
+        }
+        
+        const newConvId = response.headers.get('X-Conversation-Id');
+        if (newConvId) currentConversationId = newConvId;
+        
+        const contentType = response.headers.get('content-type');
+        
+        if (contentType && contentType.includes('application/json')) {
+            const data = await response.json();
+            if (data.conversation_id) currentConversationId = data.conversation_id;
+            renderAssistantMessage(typingId, data.answer || 'پاسخی دریافت نشد');
+            isFirstAssistantMessage = false;
+            return;
+        }
+        
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let fullAnswer = '';
+        
+        const container = document.getElementById(typingId);
+        container.innerHTML = `<div class="bg-white border border-slate-200 rounded-2xl px-4 py-2.5 shadow-sm prose prose-sm max-w-full"></div>`;
+        const contentDiv = container.querySelector('div');
+        
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            const chunk = decoder.decode(value, { stream: true });
+            fullAnswer += chunk;
+            
+            let html = isFirstAssistantMessage ? '<div class="text-xs text-amber-800 bg-amber-50 rounded-xl p-3 mb-3">⚠️ این متن توسط هوش مصنوعی تولید شده و نیاز به بررسی دارد.</div>' : '';
+            html += marked.parse(fullAnswer);
+            contentDiv.innerHTML = html;
+            if (shouldAutoScroll) scrollChat();
+        }
+        
+        contentDiv.innerHTML += '<div class="text-[10px] text-slate-400 mt-3 pt-2 border-t border-slate-100">🤖 تولید شده توسط هوش مصنوعی</div>';
+        isFirstAssistantMessage = false;
+        
+    } catch (error) {
+        console.error('Send message error:', error);
+        renderAssistantMessage(typingId, '❌ خطا در اتصال به سرور. لطفاً دوباره تلاش کنید.');
+    }
+}
+
+// ==================== مدیریت مکالمات ====================
+async function loadConversation(id) {
+    currentConversationId = id;
+    isFirstAssistantMessage = true;
+    chatBox.innerHTML = '<div class="text-center text-slate-400 py-8">در حال بارگذاری مکالمه...</div>';
+    
+    try {
+        const response = await fetch(`/chat/${id}`, {
+            headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
+        });
+        if (!response.ok) throw new Error();
+        
+        const data = await response.json();
+        chatBox.innerHTML = '';
+        
+        data.messages.forEach(msg => {
+            if (msg.role === 'user') {
+                const filesData = (msg.files || []).map(f => ({
+                    url: `/file/${f.id}`,
+                    name: f.original_name,
+                    isImage: f.mime_type?.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp)$/i.test(f.original_name)
+                }));
+                addUserMessage(msg.content, filesData);
+            } else {
+                const msgId = `msg-${msg.id}`;
+                chatBox.innerHTML += `<div class="flex justify-start" id="${msgId}"></div>`;
+                renderAssistantMessage(msgId, msg.content);
+            }
+        });
+        scrollChat(true);
+    } catch (error) {
+        console.error('Load conversation error:', error);
+        newConversation();
+    }
+}
+
+function newConversation() {
+    currentConversationId = null;
+    isFirstAssistantMessage = true;
+    chatBox.innerHTML = '<div class="text-center text-slate-400 py-8">یک مکالمه جدید را شروع کنید. سؤال حقوقی خود را بپرسید...</div>';
+}
+
+async function deleteConversation(id) {
+    if (!confirm('آیا از حذف این مکالمه اطمینان دارید؟')) return;
+    try {
+        await fetch(`/chat/${id}`, {
+            method: 'DELETE',
+            headers: { 'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content }
+        });
+        document.querySelector(`.conversation-item[data-id="${id}"]`)?.remove();
+        if (currentConversationId == id) newConversation();
+    } catch (error) {
+        alert('خطا در حذف مکالمه');
+    }
+}
+
+async function renameConversation(id) {
+    const newTitle = prompt('عنوان جدید مکالمه را وارد کنید:');
+    if (!newTitle?.trim()) return;
+    try {
+        await fetch(`/chat/${id}/rename`, {
+            method: 'PATCH',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
+            },
+            body: JSON.stringify({ title: newTitle.trim() })
+        });
+        const titleSpan = document.querySelector(`.conversation-item[data-id="${id}"] .text-sm`);
+        if (titleSpan) titleSpan.textContent = newTitle.trim();
+    } catch (error) {
+        alert('خطا در تغییر نام');
+    }
+}
+
+// ==================== رویدادها ====================
+document.querySelectorAll('.model-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const modelKey = btn.dataset.model;
+        const supportsFiles = btn.dataset.supportsFiles;
+        selectModel(modelKey, supportsFiles);
+    });
+});
+
+if (fileInput) {
+    fileInput.addEventListener('change', (e) => {
+        const files = Array.from(e.target.files);
+        files.forEach(f => selectedFiles.push(f));
+        updateFileUI();
+        e.target.value = '';
+    });
+}
+
+if (fileInputBtn) {
+    fileInputBtn.addEventListener('click', () => {
+        if (fileUploadContainer && !fileUploadContainer.classList.contains('hidden')) {
+            fileInput.click();
+        }
+    });
+}
+
+if (removeFileBtn) {
+    removeFileBtn.addEventListener('click', () => {
+        selectedFiles = [];
+        updateFileUI();
+    });
+}
+
+if (sendBtn) {
+    sendBtn.addEventListener('click', sendMessage);
+}
+
+if (questionInput) {
+    questionInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        }
+    });
+    questionInput.addEventListener('input', function() {
+        this.style.height = 'auto';
+        this.style.height = Math.min(this.scrollHeight, 160) + 'px';
+    });
+}
+
+if (chatMain) {
+    chatMain.addEventListener('scroll', () => {
+        shouldAutoScroll = chatMain.scrollHeight - chatMain.scrollTop - chatMain.clientHeight < 80;
+    });
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+    const firstModelBtn = document.querySelector('.model-btn');
+    if (firstModelBtn) {
+        selectModel(firstModelBtn.dataset.model, firstModelBtn.dataset.supportsFiles);
+    }
+    
+    const firstConv = document.querySelector('.conversation-item');
+    if (firstConv) {
+        loadConversation(firstConv.dataset.id);
+    } else {
+        newConversation();
+    }
+});
