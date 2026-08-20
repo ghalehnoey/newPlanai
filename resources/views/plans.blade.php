@@ -41,6 +41,18 @@
 </head>
 <body class="text-white">
 <div class="container mx-auto px-4 py-10 max-w-5xl">
+    @if(session('error'))
+        <div role="alert" class="mb-6 rounded-xl border border-red-400/60 bg-red-950/80 px-5 py-4 text-red-100 shadow-lg">
+            {{ session('error') }}
+        </div>
+    @endif
+
+    @if(session('success'))
+        <div role="status" class="mb-6 rounded-xl border border-emerald-400/60 bg-emerald-950/80 px-5 py-4 text-emerald-100 shadow-lg">
+            {{ session('success') }}
+        </div>
+    @endif
+
     <!-- هدر -->
     <div class="glass rounded-2xl p-6 mb-10 text-center shadow-lg border border-purple-500/20">
         <h1 class="text-3xl md:text-4xl font-extrabold mb-3 bg-gradient-to-r from-purple-300 to-pink-300 bg-clip-text text-transparent">

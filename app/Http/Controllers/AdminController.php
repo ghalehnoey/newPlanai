@@ -384,7 +384,7 @@ class AdminController extends Controller
         ]);
 
         $svc->save($request->input('system_prompt'));
-        $svc->saveTopicRestriction($request->input('topic_restriction', ''));
+        $svc->saveTopicRestriction((string) ($request->input('topic_restriction') ?? ''));
 
         return redirect()->route('admin.chatbot-settings')->with('success', 'تنظیمات چت‌بات ذخیره شد.');
     }

@@ -231,15 +231,24 @@ class ChatController extends BaseController
         ]);
     }
 
-    public function getConversation($id)
+    public function getConversation(Request $request, $id)
     {
         try {
+            $limit = (int) $request->query('limit', 30);
+            $limit = max(1, min($limit, 80));
+
+            $beforeId = $request->query('before_id');
+            $beforeId = $beforeId !== null ? (int) $beforeId : null;
+            $beforeId = $beforeId > 0 ? $beforeId : null;
+
             Log::info("🔍 getConversation called", [
                 'conversation_id' => $id,
-                'auth_user_id' => auth()->id()
+                'auth_user_id' => auth()->id(),
+                'limit' => $limit,
+                'before_id' => $beforeId,
             ]);
 
-            $conversation = Conversation::with(['messages.files'])->find($id);
+            $conversation = Conversation::find($id);
 
             if (!$conversation) {
                 Log::warning("❌ Conversation not found", ['id' => $id]);
@@ -261,8 +270,18 @@ class ChatController extends BaseController
                 ], 403);
             }
 
-            $messages = $conversation->messages
-                ->sortBy('created_at')
+            $messagePage = $conversation->messages()
+                ->with('files')
+                ->when($beforeId, fn($query) => $query->where('id', '<', $beforeId))
+                ->orderByDesc('id')
+                ->limit($limit + 1)
+                ->get();
+
+            $hasMore = $messagePage->count() > $limit;
+
+            $messages = $messagePage
+                ->take($limit)
+                ->sortBy('id')
                 ->values();
 
             $mappedMessages = $messages->map(function ($message) {
@@ -274,6 +293,7 @@ class ChatController extends BaseController
                         return [
                             'id'            => $file->id,
                             'original_name' => $file->original_name ?? basename($file->path),
+                            'mime_type'     => $file->mime_type,
                         ];
                     })->toArray(),
                 ];
@@ -281,7 +301,9 @@ class ChatController extends BaseController
 
             return response()->json([
                 'messages' => $mappedMessages,
-                'conversation_id' => $conversation->id
+                'conversation_id' => $conversation->id,
+                'has_more' => $hasMore,
+                'next_before_id' => $hasMore ? $messages->first()?->id : null,
             ]);
 
         } catch (\Throwable $e) {

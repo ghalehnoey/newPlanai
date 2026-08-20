@@ -42,8 +42,10 @@ Route::middleware('auth')->group(function () {
     Route::get('/plans',                  [PlanController::class, 'index'])->name('plans');
     Route::post('/plan/purchase/{plan}',  [PlanController::class, 'purchase'])->name('plan.purchase');
     Route::post('/payment/start/{plan}',  [PaymentController::class, 'start'])->name('payment.start');
-    Route::get('/payment/callback',       [PaymentController::class, 'callback'])->name('payment.callback');
 });
+
+// Callback must remain reachable even if the browser session is lost at the bank.
+Route::get('/payment/callback', [PaymentController::class, 'callback'])->name('payment.callback');
 
 /* ─────────────────── ADMIN PANEL ─────────────────── */
 Route::middleware(['auth', 'modir2'])->prefix('admin')->name('admin.')->group(function () {

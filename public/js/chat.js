@@ -5,6 +5,10 @@ let currentConversationId = null;
 let isFirstAssistantMessage = true;
 let shouldAutoScroll = true;
 let selectedFiles = [];
+const MESSAGE_PAGE_SIZE = 30;
+let oldestLoadedMessageId = null;
+let hasOlderMessages = false;
+let isLoadingOlderMessages = false;
 
 // DOM elements
 const chatBox = document.getElementById('chatBox');
@@ -100,35 +104,104 @@ function escapeHtml(text) {
     }).replace(/\n/g, '<br>');
 }
 
-// ==================== رندر پیام‌ها ====================
-function addUserMessage(text, filesData = []) {
-    let filesHtml = '';
-    if (filesData.length > 0) {
-        filesHtml = '<div class="flex flex-wrap gap-2 justify-end mb-2">';
-        filesData.forEach(f => {
-            if (f.isImage) {
-                filesHtml += `<img src="${f.url}" class="max-w-[100px] max-h-[100px] rounded-xl border border-indigo-200 object-cover">`;
-            } else {
-                filesHtml += `<div class="bg-white px-3 py-1.5 rounded-full text-xs shadow-sm border border-slate-200">📄 ${escapeHtml(f.name)}</div>`;
-            }
-        });
-        filesHtml += '</div>';
-    }
-    
-    chatBox.innerHTML += `
+function filesPreviewHtml(filesData = []) {
+    if (!filesData.length) return '';
+
+    let filesHtml = '<div class="flex flex-wrap gap-2 justify-end mb-2">';
+    filesData.forEach(f => {
+        if (f.isImage) {
+            filesHtml += `<img src="${f.url}" class="max-w-[100px] max-h-[100px] rounded-xl border border-indigo-200 object-cover">`;
+        } else {
+            filesHtml += `<div class="bg-white px-3 py-1.5 rounded-full text-xs shadow-sm border border-slate-200">📄 ${escapeHtml(f.name)}</div>`;
+        }
+    });
+    filesHtml += '</div>';
+
+    return filesHtml;
+}
+
+function userMessageHtml(text, filesData = []) {
+    return `
         <div class="flex justify-end">
             <div class="chat-message-user max-w-[85%] bg-indigo-50 text-slate-800 rounded-2xl px-4 py-2.5 shadow-sm">
-                ${filesHtml}
+                ${filesPreviewHtml(filesData)}
                 ${text ? `<div class="whitespace-pre-wrap break-words text-sm">${escapeHtml(text)}</div>` : ''}
             </div>
         </div>
     `;
+}
+
+function assistantInnerHtml(content, showNotice = false) {
+    const firstHeader = '<div class="text-xs text-amber-800 bg-amber-50 rounded-xl p-3 mb-3">⚠️ این متن توسط هوش مصنوعی تولید شده و نیاز به بررسی دارد.</div>';
+    const footer = '<div class="text-[10px] text-slate-400 mt-3 pt-2 border-t border-slate-100">🤖 تولید شده توسط هوش مصنوعی</div>';
+
+    let html = showNotice ? firstHeader : '';
+    html += marked.parse(content || '');
+    html += footer;
+
+    return html;
+}
+
+function assistantMessageHtml(containerId, content, showNotice = false) {
+    return `
+        <div class="flex justify-start" id="${containerId}">
+            <div class="chat-message-ai bg-white border border-slate-200 rounded-2xl px-4 py-2.5 shadow-sm prose prose-sm max-w-full">
+                ${assistantInnerHtml(content, showNotice)}
+            </div>
+        </div>
+    `;
+}
+
+function storedMessageHtml(msg, showAssistantNotice = false) {
+    if (msg.role === 'user') {
+        const filesData = (msg.files || []).map(f => ({
+            url: `/file/${f.id}`,
+            name: f.original_name,
+            isImage: f.mime_type?.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp)$/i.test(f.original_name || '')
+        }));
+
+        return userMessageHtml(msg.content, filesData);
+    }
+
+    return assistantMessageHtml(`msg-${msg.id}`, msg.content, showAssistantNotice);
+}
+
+function storedMessagesHtml(messages = [], showFirstAssistantNotice = true) {
+    let shouldShowNotice = showFirstAssistantNotice;
+
+    return messages.map(msg => {
+        const html = storedMessageHtml(msg, msg.role === 'assistant' && shouldShowNotice);
+        if (msg.role === 'assistant') shouldShowNotice = false;
+        return html;
+    }).join('');
+}
+
+function olderMessagesButtonHtml(isLoading = false) {
+    return `
+        <div id="loadOlderWrap" class="flex justify-center py-2">
+            <button id="loadOlderBtn" type="button" class="text-xs font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 rounded-full px-4 py-2 hover:bg-indigo-100 transition-smooth">
+                ${isLoading ? 'در حال بارگذاری...' : 'نمایش پیام‌های قدیمی‌تر'}
+            </button>
+        </div>
+    `;
+}
+
+function setOlderMessagesButtonLoading(isLoading) {
+    const btn = document.getElementById('loadOlderBtn');
+    if (!btn) return;
+    btn.disabled = isLoading;
+    btn.textContent = isLoading ? 'در حال بارگذاری...' : 'نمایش پیام‌های قدیمی‌تر';
+}
+
+// ==================== رندر پیام‌ها ====================
+function addUserMessage(text, filesData = []) {
+    chatBox.insertAdjacentHTML('beforeend', userMessageHtml(text, filesData));
     scrollChat(true);
 }
 
 function addAiTyping() {
     const id = 'ai-typing-' + Date.now();
-    chatBox.innerHTML += `
+    chatBox.insertAdjacentHTML('beforeend', `
         <div class="flex justify-start" id="${id}">
             <div class="bg-white border border-slate-200 rounded-2xl px-4 py-2.5 shadow-sm flex items-center gap-2">
                 <div class="flex gap-1">
@@ -139,7 +212,7 @@ function addAiTyping() {
                 <span class="text-xs text-slate-500">در حال پاسخگویی...</span>
             </div>
         </div>
-    `;
+    `);
     scrollChat(true);
     return id;
 }
@@ -148,14 +221,7 @@ function renderAssistantMessage(containerId, content) {
     const container = document.getElementById(containerId);
     if (!container) return;
     
-    const firstHeader = '<div class="text-xs text-amber-800 bg-amber-50 rounded-xl p-3 mb-3">⚠️ این متن توسط هوش مصنوعی تولید شده و نیاز به بررسی دارد.</div>';
-    const footer = '<div class="text-[10px] text-slate-400 mt-3 pt-2 border-t border-slate-100">🤖 تولید شده توسط هوش مصنوعی</div>';
-    
-    let html = isFirstAssistantMessage ? firstHeader : '';
-    html += marked.parse(content || '');
-    html += footer;
-    
-    container.innerHTML = `<div class="chat-message-ai bg-white border border-slate-200 rounded-2xl px-4 py-2.5 shadow-sm prose prose-sm max-w-full">${html}</div>`;
+    container.innerHTML = `<div class="chat-message-ai bg-white border border-slate-200 rounded-2xl px-4 py-2.5 shadow-sm prose prose-sm max-w-full">${assistantInnerHtml(content, isFirstAssistantMessage)}</div>`;
     scrollChat();
 }
 
@@ -265,31 +331,24 @@ async function sendMessage() {
 async function loadConversation(id) {
     currentConversationId = id;
     isFirstAssistantMessage = true;
+    oldestLoadedMessageId = null;
+    hasOlderMessages = false;
+    isLoadingOlderMessages = false;
     chatBox.innerHTML = '<div class="text-center text-slate-400 py-8">در حال بارگذاری مکالمه...</div>';
     
     try {
-        const response = await fetch(`/chat/${id}`, {
+        const response = await fetch(`/chat/${id}?limit=${MESSAGE_PAGE_SIZE}`, {
             headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
         });
         if (!response.ok) throw new Error();
         
         const data = await response.json();
-        chatBox.innerHTML = '';
-        
-        data.messages.forEach(msg => {
-            if (msg.role === 'user') {
-                const filesData = (msg.files || []).map(f => ({
-                    url: `/file/${f.id}`,
-                    name: f.original_name,
-                    isImage: f.mime_type?.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp)$/i.test(f.original_name)
-                }));
-                addUserMessage(msg.content, filesData);
-            } else {
-                const msgId = `msg-${msg.id}`;
-                chatBox.innerHTML += `<div class="flex justify-start" id="${msgId}"></div>`;
-                renderAssistantMessage(msgId, msg.content);
-            }
-        });
+        const messages = data.messages || [];
+        oldestLoadedMessageId = messages[0]?.id || null;
+        hasOlderMessages = Boolean(data.has_more);
+        isFirstAssistantMessage = !messages.some(msg => msg.role === 'assistant');
+
+        chatBox.innerHTML = (hasOlderMessages ? olderMessagesButtonHtml() : '') + storedMessagesHtml(messages, true);
         scrollChat(true);
     } catch (error) {
         console.error('Load conversation error:', error);
@@ -297,9 +356,49 @@ async function loadConversation(id) {
     }
 }
 
+async function loadOlderMessages() {
+    if (!currentConversationId || !oldestLoadedMessageId || !hasOlderMessages || isLoadingOlderMessages) return;
+
+    isLoadingOlderMessages = true;
+    setOlderMessagesButtonLoading(true);
+
+    const previousScrollHeight = chatMain ? chatMain.scrollHeight : 0;
+    const previousScrollTop = chatMain ? chatMain.scrollTop : 0;
+
+    try {
+        const response = await fetch(`/chat/${currentConversationId}?limit=${MESSAGE_PAGE_SIZE}&before_id=${oldestLoadedMessageId}`, {
+            headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
+        });
+        if (!response.ok) throw new Error();
+
+        const data = await response.json();
+        const messages = data.messages || [];
+        const loadOlderWrap = document.getElementById('loadOlderWrap');
+        if (loadOlderWrap) loadOlderWrap.remove();
+
+        hasOlderMessages = Boolean(data.has_more);
+        if (messages.length) oldestLoadedMessageId = messages[0].id;
+
+        chatBox.insertAdjacentHTML('afterbegin', (hasOlderMessages ? olderMessagesButtonHtml() : '') + storedMessagesHtml(messages, false));
+
+        requestAnimationFrame(() => {
+            if (!chatMain) return;
+            chatMain.scrollTop = chatMain.scrollHeight - previousScrollHeight + previousScrollTop;
+        });
+    } catch (error) {
+        console.error('Load older messages error:', error);
+        setOlderMessagesButtonLoading(false);
+    } finally {
+        isLoadingOlderMessages = false;
+    }
+}
+
 function newConversation() {
     currentConversationId = null;
     isFirstAssistantMessage = true;
+    oldestLoadedMessageId = null;
+    hasOlderMessages = false;
+    isLoadingOlderMessages = false;
     chatBox.innerHTML = '<div class="text-center text-slate-400 py-8">یک مکالمه جدید را شروع کنید. سؤال حقوقی خود را بپرسید...</div>';
 }
 
@@ -354,6 +453,14 @@ if (modelMenuBackdrop) {
     modelMenuBackdrop.addEventListener('click', () => toggleModelMenu(false));
 }
 
+if (chatBox) {
+    chatBox.addEventListener('click', (e) => {
+        if (e.target.closest('#loadOlderBtn')) {
+            loadOlderMessages();
+        }
+    });
+}
+
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') toggleModelMenu(false);
 });
@@ -402,6 +509,9 @@ if (questionInput) {
 if (chatMain) {
     chatMain.addEventListener('scroll', () => {
         shouldAutoScroll = chatMain.scrollHeight - chatMain.scrollTop - chatMain.clientHeight < 80;
+        if (chatMain.scrollTop < 120 && hasOlderMessages && !isLoadingOlderMessages) {
+            loadOlderMessages();
+        }
     });
 }
 
