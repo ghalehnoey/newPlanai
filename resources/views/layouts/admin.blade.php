@@ -108,6 +108,11 @@
                 مدل‌های AI
             </a>
 
+            <a href="{{ route('admin.ai-proxies.index') }}" class="sidebar-link {{ request()->routeIs('admin.ai-proxies.*') ? 'active' : '' }}">
+                <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 9l3 3-3 3m5 0h3M5 5h14a2 2 0 012 2v10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2z"/></svg>
+                مدیریت پراکسی‌ها
+            </a>
+
             <a href="{{ route('admin.ai-test') }}" class="sidebar-link {{ request()->routeIs('admin.ai-test*') ? 'active' : '' }}">
                 <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                 تست اتصال AI

@@ -7,11 +7,16 @@ use Illuminate\Support\Facades\DB;
 use App\Models\Plan;
 use App\Models\Subscription;
 use App\Models\AiModel;
+use App\Models\AiProxyServer;
 use App\Models\Conversation;
 use App\Models\Message;
 use App\Services\SystemPromptService;
+use App\Services\AiApiService;
+use App\Services\AiProxyRouter;
+use App\Services\RemoteProxyProvisioner;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Cache;
 use Carbon\Carbon;
 
 class AdminController extends Controller
@@ -46,43 +51,60 @@ class AdminController extends Controller
 
         $users = $query->paginate(20)->appends($request->only(['search', 'status', 'role']));
 
-        $stats = [
-            'totalUsers'           => User::count(),
-            'activeSubscriptions'  => Subscription::where('expires_at', '>', now())->count(),
-            'expiredSubscriptions' => Subscription::where('expires_at', '<=', now())->count(),
-            'noSubscriptionUsers'  => User::doesntHave('subscriptions')->count(),
-            'totalConversations'   => Conversation::count(),
-            'totalMessages'        => Message::count(),
-            'newUsersToday'        => User::whereDate('created_at', today())->count(),
-            'newUsersThisMonth'    => User::whereMonth('created_at', now()->month)->count(),
-        ];
+        $stats = Cache::remember('admin:dashboard:stats', 60, static function (): array {
+            $today = now()->startOfDay();
+            $tomorrow = $today->copy()->addDay();
+            $monthStart = $today->copy()->startOfMonth();
+            $nextMonth = $monthStart->copy()->addMonth();
 
-        $plans = Plan::orderBy('price')->get();
+            return [
+                'totalUsers'           => User::count(),
+                'activeSubscriptions'  => Subscription::where('expires_at', '>', now())->count(),
+                'expiredSubscriptions' => Subscription::where('expires_at', '<=', now())->count(),
+                'noSubscriptionUsers'  => User::doesntHave('subscriptions')->count(),
+                'totalConversations'   => Conversation::count(),
+                'totalMessages'        => Message::count(),
+                'newUsersToday'        => User::where('created_at', '>=', $today)->where('created_at', '<', $tomorrow)->count(),
+                'newUsersThisMonth'    => User::where('created_at', '>=', $monthStart)->where('created_at', '<', $nextMonth)->count(),
+            ];
+        });
 
-        $topUsers = DB::table('users as u')
-            ->leftJoin('messages as m', function ($join) {
-                $join->on('m.user_id', '=', 'u.id')->where('m.role', '=', 'user');
-            })
-            ->leftJoin('subscriptions as s', function ($join) {
-                $join->on('s.user_id', '=', 'u.id')
-                     ->whereRaw('s.id = (SELECT id FROM subscriptions WHERE user_id = u.id ORDER BY id DESC LIMIT 1)');
-            })
-            ->leftJoin('plans as p', 'p.id', '=', 's.plan_id')
-            ->select(
-                'u.id',
-                'u.name',
-                'u.phone',
-                DB::raw('COUNT(m.id) as total_messages'),
-                DB::raw('COALESCE(s.questions_used, 0) as questions_used'),
-                'p.name as plan_name',
-                's.expires_at'
-            )
-            ->groupBy('u.id', 'u.name', 'u.phone', 's.questions_used', 'p.name', 's.expires_at')
-            ->orderByDesc('total_messages')
-            ->limit(10)
-            ->get();
+        $plans = Cache::remember('admin:dashboard:plans', 300, static fn () => Plan::orderBy('price')->get());
 
-        return view('admin.dashboard', compact('users', 'stats', 'plans', 'topUsers', 'search', 'status', 'role'));
+        return view('admin.dashboard', compact('users', 'stats', 'plans', 'search', 'status', 'role'));
+    }
+
+    public function topUsers()
+    {
+        $topUsers = Cache::remember('admin:top-users', 60, function () {
+            $messageCounts = DB::table('messages')
+                ->select('user_id', DB::raw('COUNT(*) as total_messages'))
+                ->where('role', 'user')
+                ->groupBy('user_id');
+            $latestSubscriptionIds = DB::table('subscriptions')
+                ->select('user_id', DB::raw('MAX(id) as subscription_id'))
+                ->groupBy('user_id');
+
+            return DB::table('users as u')
+                ->leftJoinSub($messageCounts, 'mc', 'mc.user_id', '=', 'u.id')
+                ->leftJoinSub($latestSubscriptionIds, 'latest_s', 'latest_s.user_id', '=', 'u.id')
+                ->leftJoin('subscriptions as s', 's.id', '=', 'latest_s.subscription_id')
+                ->leftJoin('plans as p', 'p.id', '=', 's.plan_id')
+                ->select(
+                    'u.id', 'u.name', 'u.phone',
+                    DB::raw('COALESCE(mc.total_messages, 0) as total_messages'),
+                    DB::raw('COALESCE(s.questions_used, 0) as questions_used'),
+                    'p.name as plan_name', 's.expires_at'
+                )
+                ->orderByDesc('total_messages')
+                ->limit(10)
+                ->get();
+        });
+
+        return response()->json([
+            'ok' => true,
+            'html' => view('admin.partials.top_users_rows', compact('topUsers'))->render(),
+        ]);
     }
 
     public function changePassword(Request $request, User $user)
@@ -287,13 +309,14 @@ class AdminController extends Controller
 
     public function aiModelsIndex()
     {
-        $models = AiModel::orderBy('sort_order')->get();
+        $models = AiModel::with('proxyServer')->orderBy('sort_order')->get();
         return view('admin.ai_models.index', compact('models'));
     }
 
     public function aiModelsCreate()
     {
-        return view('admin.ai_models.create');
+        $proxyServers = AiProxyServer::orderBy('priority')->orderBy('name')->get();
+        return view('admin.ai_models.create', compact('proxyServers'));
     }
 
     public function aiModelsStore(Request $request)
@@ -310,13 +333,15 @@ class AdminController extends Controller
             'is_active'       => 'boolean',
             'use_proxy'       => 'boolean',
             'proxy_url'       => 'nullable|string|max:500',
+            'proxy_mode'      => 'required|in:direct,auto,proxy',
+            'proxy_server_id' => 'nullable|exists:ai_proxy_servers,id',
             'timeout_seconds' => 'nullable|integer|min:10|max:300',
             'sort_order'      => 'integer',
         ]);
 
         $validated['supports_files']  = $request->has('supports_files');
         $validated['is_active']       = $request->has('is_active');
-        $validated['use_proxy']       = $request->has('use_proxy');
+        $validated['use_proxy']       = $validated['proxy_mode'] === 'proxy';
         $validated['proxy_url']       = $request->input('proxy_url') ?: null;
         $validated['timeout_seconds'] = (int) $request->input('timeout_seconds', 120);
 
@@ -326,7 +351,8 @@ class AdminController extends Controller
 
     public function aiModelsEdit(AiModel $aiModel)
     {
-        return view('admin.ai_models.edit', compact('aiModel'));
+        $proxyServers = AiProxyServer::orderBy('priority')->orderBy('name')->get();
+        return view('admin.ai_models.edit', compact('aiModel', 'proxyServers'));
     }
 
     public function aiModelsUpdate(Request $request, AiModel $aiModel)
@@ -341,13 +367,15 @@ class AdminController extends Controller
             'is_active'       => 'boolean',
             'use_proxy'       => 'boolean',
             'proxy_url'       => 'nullable|string|max:500',
+            'proxy_mode'      => 'required|in:direct,auto,proxy',
+            'proxy_server_id' => 'nullable|exists:ai_proxy_servers,id',
             'timeout_seconds' => 'nullable|integer|min:10|max:300',
             'sort_order'      => 'integer',
         ]);
 
         $validated['supports_files']  = $request->has('supports_files');
         $validated['is_active']       = $request->has('is_active');
-        $validated['use_proxy']       = $request->has('use_proxy');
+        $validated['use_proxy']       = $validated['proxy_mode'] === 'proxy';
         $validated['proxy_url']       = $request->input('proxy_url') ?: null;
         $validated['timeout_seconds'] = (int) $request->input('timeout_seconds', 120);
 
@@ -366,6 +394,109 @@ class AdminController extends Controller
     }
 
     /* ═══════════════ CHATBOT SETTINGS (manager only) ═══════════════ */
+
+    public function aiProxyServersIndex()
+    {
+        $proxyServers = AiProxyServer::withCount('aiModels')
+            ->orderBy('priority')
+            ->orderBy('name')
+            ->get();
+
+        return view('admin.ai_proxies.index', compact('proxyServers'));
+    }
+
+    public function aiProxyServersStore(Request $request)
+    {
+        $validated = $this->validateProxyServer($request);
+        $validated['is_active'] = $request->boolean('is_active');
+        $validated['password'] = $request->filled('password') ? $request->input('password') : null;
+        $validated['ssh_password'] = $request->filled('ssh_password') ? $request->input('ssh_password') : null;
+        AiProxyServer::create($validated);
+
+        return back()->with('success', 'پراکسی جدید ذخیره شد. پیش از اتصال مدل، تست سلامت را اجرا کنید.');
+    }
+
+    public function aiProxyServersUpdate(Request $request, AiProxyServer $aiProxyServer)
+    {
+        $validated = $this->validateProxyServer($request);
+        $validated['is_active'] = $request->boolean('is_active');
+        $hostChanged = $aiProxyServer->host !== $validated['host']
+            || (int) $aiProxyServer->ssh_port !== (int) $validated['ssh_port'];
+
+        if ($request->boolean('clear_password')) {
+            $validated['password'] = null;
+        } elseif ($request->filled('password')) {
+            $validated['password'] = $request->input('password');
+        } else {
+            unset($validated['password']);
+        }
+
+        if ($request->boolean('clear_ssh_password')) {
+            $validated['ssh_password'] = null;
+        } elseif ($request->filled('ssh_password')) {
+            $validated['ssh_password'] = $request->input('ssh_password');
+        } else {
+            unset($validated['ssh_password']);
+        }
+
+        if ($hostChanged) {
+            $validated['ssh_host_fingerprint'] = null;
+            $validated['provision_status'] = 'not_started';
+            $validated['provision_message'] = 'آدرس سرور تغییر کرده است؛ provisioning را دوباره اجرا کنید.';
+        }
+
+        $aiProxyServer->update($validated);
+
+        return back()->with('success', 'تنظیمات پراکسی به‌روزرسانی شد.');
+    }
+
+    public function aiProxyServersDestroy(AiProxyServer $aiProxyServer)
+    {
+        $aiProxyServer->delete();
+
+        return back()->with('success', 'پراکسی حذف شد و اتصال مدل‌های مرتبط آزاد شد.');
+    }
+
+    public function aiProxyServersTest(AiProxyServer $aiProxyServer, AiProxyRouter $proxyRouter)
+    {
+        return response()->json($proxyRouter->testProxy($aiProxyServer));
+    }
+
+    public function aiProxyServersProvision(AiProxyServer $aiProxyServer, RemoteProxyProvisioner $provisioner)
+    {
+        try {
+            return response()->json($provisioner->provision($aiProxyServer));
+        } catch (\Throwable $exception) {
+            return response()->json([
+                'ok' => false,
+                'status' => 'failed',
+                'message' => $exception->getMessage(),
+            ], 422);
+        }
+    }
+
+    /** @return array<string, mixed> */
+    private function validateProxyServer(Request $request): array
+    {
+        return $request->validate([
+            'name' => 'required|string|max:255',
+            'scheme' => 'required|in:socks5h,socks5,http,https',
+            'host' => ['required', 'string', 'max:255', 'regex:/^(?!https?:\/\/|socks5h?:\/\/)[A-Za-z0-9._:-]+$/'],
+            'port' => 'required|integer|min:1|max:65535',
+            'username' => 'nullable|string|max:255',
+            'password' => 'nullable|string|max:500',
+            'is_active' => 'boolean',
+            'priority' => 'required|integer|min:1|max:10000',
+            'connect_timeout' => 'required|integer|min:3|max:60',
+            'notes' => 'nullable|string|max:2000',
+            'clear_password' => 'boolean',
+            'ssh_port' => 'required|integer|min:1|max:65535',
+            'ssh_username' => ['nullable', 'string', 'max:255', 'regex:/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/'],
+            'ssh_password' => 'nullable|string|max:1000',
+            'clear_ssh_password' => 'boolean',
+            'allowed_source_ip' => 'required|ip',
+        ]);
+    }
 
     public function chatbotSettings(SystemPromptService $svc)
     {
@@ -490,12 +621,25 @@ class AdminController extends Controller
 
     public function aiTest()
     {
-        $models = \App\Models\AiModel::orderBy('sort_order')->get();
-        return view('admin.ai_test', compact('models'));
+        $models = AiModel::with('proxyServer')->orderBy('sort_order')->get();
+        $proxyServers = AiProxyServer::where('is_active', true)->orderBy('priority')->orderBy('name')->get();
+        return view('admin.ai_test', compact('models', 'proxyServers'));
     }
 
-    public function aiTestRun(\Illuminate\Http\Request $request)
+    public function aiTestRun(Request $request, AiApiService $aiApiService)
     {
+        $validated = $request->validate([
+            'model_key' => 'required|string|exists:ai_models,key',
+            'route_type' => 'required|in:direct,proxy',
+            'proxy_server_id' => 'nullable|exists:ai_proxy_servers,id',
+        ]);
+        $model = AiModel::where('key', $validated['model_key'])->firstOrFail();
+        $proxy = $validated['route_type'] === 'proxy'
+            ? AiProxyServer::where('is_active', true)->find($validated['proxy_server_id'] ?? null)
+            : null;
+
+        return response()->json($aiApiService->diagnoseModel($model, $validated['route_type'], $proxy));
+
         $modelKey  = $request->input('model_key');
         $useProxy  = (bool) $request->input('use_proxy', false);
         $proxyUrl  = trim($request->input('proxy_url', 'socks5h://127.0.0.1:1080'));

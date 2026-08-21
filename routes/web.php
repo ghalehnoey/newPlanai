@@ -62,12 +62,19 @@ Route::middleware(['auth', 'modir2'])->prefix('admin')->name('admin.')->group(fu
 });
 
 Route::middleware(['auth', 'manager'])->prefix('admin')->name('admin.')->group(function () {
+    Route::get('/top-users',                   [AdminController::class, 'topUsers'])->name('top-users');
     Route::get('/ai-models',                  [AdminController::class, 'aiModelsIndex'])->name('ai-models.index');
     Route::get('/ai-models/create',           [AdminController::class, 'aiModelsCreate'])->name('ai-models.create');
     Route::post('/ai-models',                 [AdminController::class, 'aiModelsStore'])->name('ai-models.store');
     Route::get('/ai-models/{aiModel}/edit',   [AdminController::class, 'aiModelsEdit'])->name('ai-models.edit');
     Route::put('/ai-models/{aiModel}',        [AdminController::class, 'aiModelsUpdate'])->name('ai-models.update');
     Route::delete('/ai-models/{aiModel}',     [AdminController::class, 'aiModelsDestroy'])->name('ai-models.destroy');
+    Route::get('/ai-proxies',                 [AdminController::class, 'aiProxyServersIndex'])->name('ai-proxies.index');
+    Route::post('/ai-proxies',                [AdminController::class, 'aiProxyServersStore'])->name('ai-proxies.store');
+    Route::put('/ai-proxies/{aiProxyServer}', [AdminController::class, 'aiProxyServersUpdate'])->name('ai-proxies.update');
+    Route::delete('/ai-proxies/{aiProxyServer}', [AdminController::class, 'aiProxyServersDestroy'])->name('ai-proxies.destroy');
+    Route::post('/ai-proxies/{aiProxyServer}/test', [AdminController::class, 'aiProxyServersTest'])->name('ai-proxies.test');
+    Route::post('/ai-proxies/{aiProxyServer}/provision', [AdminController::class, 'aiProxyServersProvision'])->name('ai-proxies.provision');
     Route::get('/stats',                      [AdminController::class, 'stats'])->name('stats');
     Route::get('/reports/repeat-purchasers',   [AdminController::class, 'repeatPurchasersExport'])->name('reports.repeat-purchasers');
     Route::get('/system',                     [AdminController::class, 'systemSettings'])->name('system');

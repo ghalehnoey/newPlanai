@@ -2,6 +2,8 @@
 
 namespace App\Services;
 
+use App\Exceptions\AiRequestException;
+use App\Models\AiProxyServer;
 use GuzzleHttp\Client;
 use RuntimeException;
 use Throwable;
@@ -11,7 +13,15 @@ use App\Models\AiModel;
 
 class AiApiService
 {
-    public function __construct(private FileService $fileService) {}
+    private const MAX_DOCUMENT_CONTEXT_CHARACTERS = 120000;
+    private const MAX_SINGLE_DOCUMENT_CHARACTERS = 80000;
+    private const MAX_PDF_VISION_PAGES_PER_FILE = 12;
+    private const MAX_PDF_VISION_PAGES_PER_REQUEST = 20;
+
+    public function __construct(
+        private FileService $fileService,
+        private AiProxyRouter $proxyRouter,
+    ) {}
 
     // ============ کانفیگ ============
     private function getModelConfig(string $modelKey): AiModel
@@ -54,16 +64,17 @@ class AiApiService
         ];
     }
 
+    /** @deprecated Kept temporarily for compatibility with the legacy fallback block. */
     private function client(int $timeout = 150): Client
     {
         return new Client(['timeout' => $timeout]);
     }
 
+    /** @deprecated Routing is now handled by AiProxyRouter. */
     private function requiresProxy(AiModel $model): bool
     {
         return (bool) $model->use_proxy;
     }
-
 
     private function resizeImageForProxy(string $fullPath, string $mime): array
     {
@@ -99,6 +110,93 @@ class AiApiService
         return [$jpeg, 'image/jpeg'];
     }
 
+    private function documentTextForAi(
+        object $fileModel,
+        string $fullPath,
+        string $mime,
+        int &$remainingCharacters
+    ): ?string {
+        if ($remainingCharacters <= 0) {
+            return null;
+        }
+
+        $text = trim((string) ($fileModel->extracted_text ?? ''));
+
+        if ($text === '') {
+            $text = trim((string) $this->fileService->extractText($fullPath, $mime));
+        }
+
+        if ($text === '') {
+            Log::warning('No readable text found in uploaded document', [
+                'path' => $fileModel->path ?? null,
+                'mime_type' => $mime,
+            ]);
+
+            return null;
+        }
+
+        $limit = min(self::MAX_SINGLE_DOCUMENT_CHARACTERS, $remainingCharacters);
+        $textLength = mb_strlen($text);
+        $includedLength = min($textLength, $limit);
+        $text = mb_substr($text, 0, $limit);
+        $remainingCharacters -= $includedLength;
+
+        if ($textLength > $limit) {
+            $text .= "\n\n[ادامه متن به‌دلیل طول زیاد فایل در این درخواست ارسال نشد.]";
+        }
+
+        return $text;
+    }
+
+    private function isPdfFile(object $fileModel, string $fullPath, string $mime): bool
+    {
+        return $mime === 'application/pdf'
+            || strtolower((string) ($fileModel->type ?? '')) === 'pdf'
+            || strtolower(pathinfo($fullPath, PATHINFO_EXTENSION)) === 'pdf';
+    }
+
+    private function appendPdfVisionPages(
+        array &$content,
+        object $fileModel,
+        string $fullPath,
+        int &$remainingPages
+    ): int {
+        if ($remainingPages <= 0) {
+            return 0;
+        }
+
+        $pageLimit = min(self::MAX_PDF_VISION_PAGES_PER_FILE, $remainingPages);
+        $pages = $this->fileService->renderPdfPagesAsImages($fullPath, $pageLimit);
+
+        if (empty($pages)) {
+            Log::warning('No PDF page images were rendered for AI', [
+                'path' => $fileModel->path ?? null,
+            ]);
+
+            return 0;
+        }
+
+        $fileName = $fileModel->original_name ?? 'PDF';
+
+        foreach ($pages as $page) {
+            $content[] = [
+                'type' => 'text',
+                'text' => "تصویر صفحه {$page['page']} از فایل PDF «{$fileName}»:",
+            ];
+            $content[] = [
+                'type' => 'image_url',
+                'image_url' => [
+                    'url' => "data:{$page['mime_type']};base64," . base64_encode($page['data']),
+                ],
+            ];
+        }
+
+        $renderedCount = count($pages);
+        $remainingPages -= $renderedCount;
+
+        return $renderedCount;
+    }
+
     private function buildOpenAiSimpleContent(string $question, array $uploadedFiles): string|array
     {
         if (empty($uploadedFiles)) {
@@ -107,12 +205,15 @@ class AiApiService
 
         $content = [];
 
-        if ($question !== '') {
-            $content[] = [
-                'type' => 'text',
-                'text' => $question,
-            ];
-        }
+        $content[] = [
+            'type' => 'text',
+            'text' => trim($question) !== ''
+                ? trim($question)
+                : 'فایل پیوست را تحلیل کن و نکات مهم آن را توضیح بده.',
+        ];
+
+        $remainingDocumentCharacters = self::MAX_DOCUMENT_CONTEXT_CHARACTERS;
+        $remainingPdfVisionPages = self::MAX_PDF_VISION_PAGES_PER_REQUEST;
 
         foreach ($uploadedFiles as $fileModel) {
             $fullPath = storage_path('app/public/' . $fileModel->path);
@@ -140,8 +241,50 @@ class AiApiService
                 continue;
             }
 
+            if ($this->isPdfFile($fileModel, $fullPath, $mime)) {
+                try {
+                    $fileName = $fileModel->original_name ?? 'PDF';
+                    $extractedText = $this->documentTextForAi(
+                        $fileModel,
+                        $fullPath,
+                        $mime,
+                        $remainingDocumentCharacters
+                    );
+
+                    if (trim((string) $extractedText) !== '') {
+                        $content[] = [
+                            'type' => 'text',
+                            'text' => "\n\n--- متن استخراج‌شده از PDF {$fileName} ---\n{$extractedText}\n------------------\n",
+                        ];
+                    }
+
+                    $renderedPages = $this->appendPdfVisionPages(
+                        $content,
+                        $fileModel,
+                        $fullPath,
+                        $remainingPdfVisionPages
+                    );
+
+                    if ($renderedPages === 0 && trim((string) $extractedText) === '') {
+                        throw new RuntimeException("محتوای PDF {$fileName} قابل پردازش نیست.");
+                    }
+                } catch (Throwable $e) {
+                    Log::error('OpenAI PDF processing failed', [
+                        'path' => $fileModel->path,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+
+                continue;
+            }
+
             try {
-                $extractedText = $this->fileService->extractText($fullPath, $mime);
+                $extractedText = $this->documentTextForAi(
+                    $fileModel,
+                    $fullPath,
+                    $mime,
+                    $remainingDocumentCharacters
+                );
                 $fileName = $fileModel->original_name ?? 'file';
 
                 if (trim((string) $extractedText) !== '') {
@@ -215,7 +358,7 @@ class AiApiService
         Log::info('OPENAI_SIMPLE_REQUEST_START', [
             'url' => $url,
             'model' => $modelName,
-            'proxy' => $proxyUrl,
+            'proxy' => $proxyUrl !== '' ? preg_replace('#(://)([^:@/]+):([^@/]+)@#', '$1***:***@', $proxyUrl) : null,
             'question_len' => mb_strlen($question),
             'payload_bytes' => strlen($payload),
             'message_count' => 1,
@@ -229,7 +372,7 @@ class AiApiService
 
         $ch = curl_init($url);
 
-        curl_setopt_array($ch, [
+        $curlOptions = [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => $payload,
@@ -238,12 +381,13 @@ class AiApiService
                 'Authorization: Bearer ' . $apiKey,
                 'Content-Length: ' . strlen($payload),
             ],
-            ...($proxyUrl !== '' ? [CURLOPT_PROXY => $proxyUrl, CURLOPT_PROXYTYPE => CURLPROXY_SOCKS5_HOSTNAME] : []),
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_TIMEOUT => 120,
             CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
-        ]);
+        ];
+        $this->proxyRouter->applyCurlProxy($curlOptions, $proxyUrl);
+        curl_setopt_array($ch, $curlOptions);
 
         $response = curl_exec($ch);
 
@@ -299,6 +443,321 @@ class AiApiService
         }
 
         return trim((string) $answer);
+    }
+
+    /**
+     * @param array<string, mixed> $body
+     * @param array{type:string,label:string,proxy:?AiProxyServer,proxy_url:?string} $route
+     * @return array{data:array<string,mixed>,http:int,elapsed_ms:int,primary_ip:string}
+     */
+    private function requestJson(
+        AiModel $model,
+        string $url,
+        string $apiKey,
+        array $body,
+        array $route
+    ): array {
+        $payload = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+        if (!is_string($payload)) {
+            throw new RuntimeException('ساخت درخواست JSON ناموفق بود.');
+        }
+
+        $ch = curl_init($url);
+        $options = [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_HTTPHEADER => [
+                'Accept: application/json',
+                'Content-Type: application/json',
+                'Authorization: Bearer ' . trim($apiKey),
+                'Content-Length: ' . strlen($payload),
+            ],
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_CONNECTTIMEOUT => min(30, max(5, (int) ($model->timeout_seconds ?? 120))),
+            CURLOPT_TIMEOUT => max(10, (int) ($model->timeout_seconds ?? 120)),
+            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+        ];
+        $this->proxyRouter->applyCurlProxy($options, $route['proxy_url']);
+        curl_setopt_array($ch, $options);
+
+        $startedAt = microtime(true);
+        $response = curl_exec($ch);
+        $elapsedMs = (int) round((microtime(true) - $startedAt) * 1000);
+        $curlErrno = curl_errno($ch);
+        $curlError = curl_error($ch);
+        $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $primaryIp = (string) curl_getinfo($ch, CURLINFO_PRIMARY_IP);
+        curl_close($ch);
+
+        if ($curlErrno !== 0) {
+            throw new AiRequestException(
+                $this->proxyRouter->sanitizeError("cURL error {$curlErrno}: {$curlError}"),
+                $httpCode,
+                $curlErrno,
+                $elapsedMs,
+                $primaryIp,
+            );
+        }
+
+        $data = is_string($response) ? json_decode($response, true) : null;
+
+        if ($httpCode < 200 || $httpCode >= 300) {
+            throw new AiRequestException(
+                "HTTP {$httpCode}: " . $this->apiErrorMessage($data, (string) $response),
+                $httpCode,
+                0,
+                $elapsedMs,
+                $primaryIp,
+            );
+        }
+
+        if (!is_array($data)) {
+            throw new AiRequestException('پاسخ API از نوع JSON معتبر نیست.', $httpCode, 0, $elapsedMs, $primaryIp);
+        }
+
+        if (isset($data['error'])) {
+            throw new AiRequestException(
+                "API error: " . $this->apiErrorMessage($data, (string) $response),
+                $httpCode,
+                0,
+                $elapsedMs,
+                $primaryIp,
+            );
+        }
+
+        return [
+            'data' => $data,
+            'http' => $httpCode,
+            'elapsed_ms' => $elapsedMs,
+            'primary_ip' => $primaryIp,
+        ];
+    }
+
+    /** @param array<string, mixed>|null $data */
+    private function apiErrorMessage(?array $data, string $raw): string
+    {
+        $error = $data['error'] ?? null;
+
+        if (is_array($error)) {
+            return mb_substr((string) ($error['message'] ?? json_encode($error, JSON_UNESCAPED_UNICODE)), 0, 800);
+        }
+
+        if (is_string($error) && $error !== '') {
+            return mb_substr($error, 0, 800);
+        }
+
+        $plain = trim((string) preg_replace('/\s+/', ' ', strip_tags($raw)));
+
+        return $plain !== '' ? mb_substr($plain, 0, 500) : 'پاسخ خطا بدون توضیح دریافت شد.';
+    }
+
+    private function completionTokenField(AiModel $model): string
+    {
+        return str_contains(strtolower((string) $model->endpoint), 'api.openai.com')
+            && preg_match('/^(gpt-5|o[134])/', strtolower((string) $model->model_mapping))
+                ? 'max_completion_tokens'
+                : 'max_tokens';
+    }
+
+    /**
+     * @param array<string, mixed> $body
+     * @param array{type:string,label:string,proxy:?AiProxyServer,proxy_url:?string} $route
+     */
+    private function requestStream(
+        AiModel $model,
+        string $url,
+        string $apiKey,
+        array $body,
+        array $route,
+        ?callable $onChunk
+    ): int {
+        $body['stream'] = true;
+        $payload = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+        if (!is_string($payload)) {
+            throw new RuntimeException('ساخت درخواست JSON ناموفق بود.');
+        }
+
+        $buffer = '';
+        $rawBody = '';
+        $receivedContent = false;
+        $processLine = static function (string $line) use (&$receivedContent, $onChunk): void {
+            $line = trim($line);
+
+            if ($line === '' || $line === 'data: [DONE]' || !str_starts_with($line, 'data: ')) {
+                return;
+            }
+
+            $data = json_decode(substr($line, 6), true);
+            $chunk = $data['choices'][0]['delta']['content'] ?? '';
+
+            if (is_string($chunk) && $chunk !== '') {
+                $receivedContent = true;
+
+                if ($onChunk) {
+                    $onChunk($chunk);
+                }
+            }
+        };
+
+        $ch = curl_init($url);
+        $options = [
+            CURLOPT_RETURNTRANSFER => false,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_HTTPHEADER => [
+                'Accept: text/event-stream',
+                'Content-Type: application/json',
+                'Authorization: Bearer ' . trim($apiKey),
+                'Content-Length: ' . strlen($payload),
+            ],
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_CONNECTTIMEOUT => min(30, max(5, (int) ($model->timeout_seconds ?? 120))),
+            CURLOPT_TIMEOUT => max(30, (int) ($model->timeout_seconds ?? 120)),
+            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+            CURLOPT_WRITEFUNCTION => static function ($curl, string $chunk) use (&$buffer, &$rawBody, $processLine): int {
+                if (strlen($rawBody) < 20000) {
+                    $rawBody .= substr($chunk, 0, 20000 - strlen($rawBody));
+                }
+
+                $buffer .= $chunk;
+
+                while (($position = strpos($buffer, "\n")) !== false) {
+                    $line = substr($buffer, 0, $position);
+                    $buffer = substr($buffer, $position + 1);
+                    $processLine($line);
+                }
+
+                return strlen($chunk);
+            },
+        ];
+        $this->proxyRouter->applyCurlProxy($options, $route['proxy_url']);
+        curl_setopt_array($ch, $options);
+
+        $startedAt = microtime(true);
+        curl_exec($ch);
+        $elapsedMs = (int) round((microtime(true) - $startedAt) * 1000);
+        $curlErrno = curl_errno($ch);
+        $curlError = curl_error($ch);
+        $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $primaryIp = (string) curl_getinfo($ch, CURLINFO_PRIMARY_IP);
+        curl_close($ch);
+
+        if ($buffer !== '') {
+            $processLine($buffer);
+        }
+
+        if ($curlErrno !== 0) {
+            throw new AiRequestException(
+                $this->proxyRouter->sanitizeError("cURL error {$curlErrno}: {$curlError}"),
+                $httpCode,
+                $curlErrno,
+                $elapsedMs,
+                $primaryIp,
+            );
+        }
+
+        if ($httpCode < 200 || $httpCode >= 300) {
+            $decoded = json_decode($rawBody, true);
+            throw new AiRequestException(
+                "HTTP {$httpCode}: " . $this->apiErrorMessage(is_array($decoded) ? $decoded : null, $rawBody),
+                $httpCode,
+                0,
+                $elapsedMs,
+                $primaryIp,
+            );
+        }
+
+        if (!$receivedContent) {
+            $decoded = json_decode($rawBody, true);
+            $content = is_array($decoded) ? ($decoded['choices'][0]['message']['content'] ?? '') : '';
+
+            if (!is_string($content) || trim($content) === '') {
+                throw new AiRequestException('پاسخ مدل خالی بود.', $httpCode, 0, $elapsedMs, $primaryIp);
+            }
+
+            if ($onChunk) {
+                $onChunk($content);
+            }
+        }
+
+        return $elapsedMs;
+    }
+
+    /** @return array<string, mixed> */
+    public function diagnoseModel(AiModel $model, string $routeType, ?AiProxyServer $proxy = null): array
+    {
+        $provider = $this->getProviderConfigByModel($model);
+
+        if (!$provider['api_key']) {
+            return ['ok' => false, 'http' => 0, 'elapsed_ms' => 0, 'diagnosis' => 'کلید API تنظیم نشده است.'];
+        }
+
+        if ($routeType === 'proxy' && !$proxy) {
+            return ['ok' => false, 'http' => 0, 'elapsed_ms' => 0, 'diagnosis' => 'یک پراکسی فعال انتخاب کنید.'];
+        }
+
+        $route = [
+            'type' => $routeType,
+            'label' => $proxy?->name ?? 'direct',
+            'proxy' => $proxy,
+            'proxy_url' => $proxy?->proxyUrl(),
+        ];
+        $body = [
+            'model' => $this->resolveModel($model),
+            'messages' => [['role' => 'user', 'content' => 'Reply with exactly: OK']],
+            'temperature' => 0,
+            'stream' => false,
+        ];
+        $body[$this->completionTokenField($model)] = 10;
+
+        try {
+            $result = $this->requestJson($model, $provider['base_url'], $provider['api_key'], $body, $route);
+            $answer = $result['data']['choices'][0]['message']['content'] ?? '';
+
+            if ($routeType === 'direct') {
+                $this->proxyRouter->markDirectSuccess($model);
+            } else {
+                $this->proxyRouter->markProxyResult($proxy, true, $result['elapsed_ms']);
+            }
+
+            return [
+                'ok' => trim((string) $answer) !== '',
+                'http' => $result['http'],
+                'elapsed_ms' => $result['elapsed_ms'],
+                'api_server_ip' => $result['primary_ip'],
+                'answer' => trim((string) $answer),
+                'diagnosis' => trim((string) $answer) !== '' ? 'اتصال و پاسخ مدل موفق بود.' : 'اتصال برقرار شد اما پاسخ مدل خالی بود.',
+                'route_label' => $route['label'],
+                'usage' => $result['data']['usage'] ?? null,
+            ];
+        } catch (Throwable $exception) {
+            if ($routeType === 'direct') {
+                $this->proxyRouter->markDirectFailure($model, $exception);
+            } else {
+                $this->proxyRouter->markProxyResult(
+                    $proxy,
+                    false,
+                    $exception instanceof AiRequestException ? $exception->elapsedMs : 0,
+                    $exception->getMessage(),
+                );
+            }
+
+            $http = $exception instanceof AiRequestException ? $exception->httpCode : 0;
+            $errno = $exception instanceof AiRequestException ? $exception->curlErrno : 0;
+
+            return [
+                'ok' => false,
+                'http' => $http,
+                'elapsed_ms' => $exception instanceof AiRequestException ? $exception->elapsedMs : 0,
+                'api_server_ip' => $exception instanceof AiRequestException ? $exception->primaryIp : '',
+                'diagnosis' => $this->proxyRouter->diagnose($errno, $http, $exception->getMessage()),
+                'error' => $this->proxyRouter->sanitizeError($exception->getMessage()),
+                'route_label' => $route['label'],
+            ];
+        }
     }
 
     // ============ زنجیرهٔ مدل‌ها ============
@@ -367,12 +826,15 @@ class AiApiService
 
         $userContent = [];
 
-        if (trim($message) !== '') {
-            $userContent[] = [
-                'type' => 'text',
-                'text' => trim($message),
-            ];
-        }
+        $userContent[] = [
+            'type' => 'text',
+            'text' => trim($message) !== ''
+                ? trim($message)
+                : 'فایل پیوست را تحلیل کن و نکات مهم آن را توضیح بده.',
+        ];
+
+        $remainingDocumentCharacters = self::MAX_DOCUMENT_CONTEXT_CHARACTERS;
+        $remainingPdfVisionPages = self::MAX_PDF_VISION_PAGES_PER_REQUEST;
 
         foreach ($uploadedFiles as $fileModel) {
             $fullPath = storage_path('app/public/' . $fileModel->path);
@@ -397,15 +859,55 @@ class AiApiService
                         'url' => "data:{$mime};base64,{$base64}",
                     ],
                 ];
+            } elseif ($this->isPdfFile($fileModel, $fullPath, $mime)) {
+                try {
+                    $fileName = $fileModel->original_name ?? 'PDF';
+                    $extractedText = $this->documentTextForAi(
+                        $fileModel,
+                        $fullPath,
+                        $mime,
+                        $remainingDocumentCharacters
+                    );
+
+                    if (trim((string) $extractedText) !== '') {
+                        $userContent[] = [
+                            'type' => 'text',
+                            'text' => "\n\n--- متن استخراج‌شده از PDF {$fileName} ---\n{$extractedText}\n------------------\n",
+                        ];
+                    }
+
+                    $renderedPages = $this->appendPdfVisionPages(
+                        $userContent,
+                        $fileModel,
+                        $fullPath,
+                        $remainingPdfVisionPages
+                    );
+
+                    if ($renderedPages === 0 && trim((string) $extractedText) === '') {
+                        throw new RuntimeException("محتوای PDF {$fileName} قابل پردازش نیست.");
+                    }
+                } catch (Throwable $e) {
+                    Log::error('PDF vision processing failed', [
+                        'path' => $fileModel->path,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
             } else {
                 try {
-                    $extractedText = $this->fileService->extractText($fullPath, $mime);
+                    $extractedText = $this->documentTextForAi(
+                        $fileModel,
+                        $fullPath,
+                        $mime,
+                        $remainingDocumentCharacters
+                    );
                     $fileName = $fileModel->original_name ?? 'فایل';
 
-                    $userContent[] = [
-                        'type' => 'text',
-                        'text' => "\n\n--- محتوای فایل {$fileName} ---\n{$extractedText}\n------------------\n",
-                    ];
+                    if (trim((string) $extractedText) !== '') {
+                        $userContent[] = [
+                            'type' => 'text',
+                            'text' => "\n\n--- محتوای فایل {$fileName} ---\n{$extractedText}\n------------------\n",
+                        ];
+                    }
                 } catch (Throwable $e) {
                     Log::error('Text extraction failed', [
                         'error' => $e->getMessage(),
@@ -457,6 +959,15 @@ class AiApiService
         $needsFiles = !empty($uploadedFiles);
         $chain = $this->getModelChain($model, $needsFiles);
         $errors = [];
+
+        return $this->callWithRouting(
+            $message,
+            $model,
+            $systemPrompt,
+            $history,
+            $uploadedFiles,
+            $chain,
+        );
 
         foreach ($chain as $modelConfig) {
             try {
@@ -556,6 +1067,18 @@ class AiApiService
         $chain = $this->getModelChain($model, $needsFiles);
         $errors = [];
         $hasStarted = false;
+
+        $this->streamWithRouting(
+            $question,
+            $model,
+            $systemPrompt,
+            $history,
+            $uploadedFiles,
+            $chain,
+            $onChunk,
+        );
+
+        return;
 
         foreach ($chain as $modelConfig) {
             if ($hasStarted) {
@@ -690,6 +1213,235 @@ class AiApiService
         }
 
         Log::error('All stream models failed', ['errors' => $errors]);
+    }
+
+    /**
+     * @param array<int, AiModel> $chain
+     */
+    private function callWithRouting(
+        string $message,
+        string $requestedModel,
+        string $systemPrompt,
+        array $history,
+        array $uploadedFiles,
+        array $chain,
+    ): string {
+        $needsFiles = $uploadedFiles !== [];
+        $errors = [];
+
+        foreach ($chain as $modelConfig) {
+            try {
+                $provider = $this->getProviderConfigByModel($modelConfig);
+
+                if (!$provider['api_key']) {
+                    throw new RuntimeException("کلید API برای مدل {$modelConfig->key} تنظیم نشده است.");
+                }
+
+                $messages = ($needsFiles && $modelConfig->supports_files)
+                    ? $this->buildMessagesWithFiles($systemPrompt, $history, $message, $uploadedFiles)
+                    : $this->buildMessages($systemPrompt, $history, $message);
+                $body = [
+                    'model' => $this->resolveModel($modelConfig),
+                    'messages' => $messages,
+                    'temperature' => 0.7,
+                    'stream' => false,
+                ];
+                $body[$this->completionTokenField($modelConfig)] = 4000;
+                $routes = $this->proxyRouter->routesFor($modelConfig);
+
+                if ($routes === []) {
+                    throw new RuntimeException("برای مدل {$modelConfig->key} مسیر پراکسی فعالی وجود ندارد.");
+                }
+
+                $lastException = null;
+
+                foreach ($routes as $route) {
+                    try {
+                        $result = $this->requestJson(
+                            $modelConfig,
+                            $provider['base_url'],
+                            $provider['api_key'],
+                            $body,
+                            $route,
+                        );
+                        $content = $result['data']['choices'][0]['message']['content'] ?? '';
+
+                        if (trim((string) $content) === '') {
+                            throw new AiRequestException(
+                                "پاسخ خالی از مدل {$modelConfig->key}",
+                                $result['http'],
+                                0,
+                                $result['elapsed_ms'],
+                                $result['primary_ip'],
+                            );
+                        }
+
+                        if ($route['type'] === 'direct') {
+                            $this->proxyRouter->markDirectSuccess($modelConfig);
+                        } else {
+                            $this->proxyRouter->markProxyResult($route['proxy'], true, $result['elapsed_ms']);
+                        }
+
+                        Log::info('AI route succeeded', [
+                            'requested_model' => $requestedModel,
+                            'used_model' => $modelConfig->key,
+                            'route' => $route['label'],
+                            'elapsed_ms' => $result['elapsed_ms'],
+                        ]);
+
+                        return trim((string) $content);
+                    } catch (Throwable $exception) {
+                        $lastException = $exception;
+                        $errors[$modelConfig->key . ':' . $route['label']] = $exception->getMessage();
+
+                        if ($route['type'] === 'direct') {
+                            $this->proxyRouter->markDirectFailure($modelConfig, $exception);
+
+                            if (!$this->proxyRouter->shouldRetryThroughProxy($exception)) {
+                                break;
+                            }
+                        } else {
+                            $this->proxyRouter->markProxyResult(
+                                $route['proxy'],
+                                false,
+                                $exception instanceof AiRequestException ? $exception->elapsedMs : 0,
+                                $exception->getMessage(),
+                            );
+                        }
+
+                        Log::warning('AI route failed', [
+                            'model' => $modelConfig->key,
+                            'route' => $route['label'],
+                            'error' => $this->proxyRouter->sanitizeError($exception->getMessage()),
+                        ]);
+                    }
+                }
+
+                if ($lastException) {
+                    throw $lastException;
+                }
+            } catch (Throwable $exception) {
+                $errors[$modelConfig->key] = $exception->getMessage();
+            }
+        }
+
+        Log::error('All AI models failed sync', ['errors' => $errors]);
+
+        return 'متأسفانه در حال حاضر امکان پاسخ‌گویی وجود ندارد. لطفاً چند لحظه بعد دوباره تلاش کنید.';
+    }
+
+    /**
+     * @param array<int, AiModel> $chain
+     */
+    private function streamWithRouting(
+        string $question,
+        string $requestedModel,
+        string $systemPrompt,
+        array $history,
+        array $uploadedFiles,
+        array $chain,
+        ?callable $onChunk,
+    ): void {
+        $needsFiles = $uploadedFiles !== [];
+        $errors = [];
+        $hasStarted = false;
+
+        foreach ($chain as $modelConfig) {
+            try {
+                $provider = $this->getProviderConfigByModel($modelConfig);
+
+                if (!$provider['api_key']) {
+                    throw new RuntimeException("کلید API برای مدل {$modelConfig->key} تنظیم نشده است.");
+                }
+
+                $messages = ($needsFiles && $modelConfig->supports_files)
+                    ? $this->buildMessagesWithFiles($systemPrompt, $history, $question, $uploadedFiles)
+                    : $this->buildMessages($systemPrompt, $history, $question);
+                $body = [
+                    'model' => $this->resolveModel($modelConfig),
+                    'messages' => $messages,
+                    'temperature' => 0.7,
+                ];
+                $body[$this->completionTokenField($modelConfig)] = 4000;
+                $routes = $this->proxyRouter->routesFor($modelConfig);
+
+                if ($routes === []) {
+                    throw new RuntimeException("برای مدل {$modelConfig->key} مسیر پراکسی فعالی وجود ندارد.");
+                }
+
+                $lastException = null;
+
+                foreach ($routes as $route) {
+                    try {
+                        $elapsedMs = $this->requestStream(
+                            $modelConfig,
+                            $provider['base_url'],
+                            $provider['api_key'],
+                            $body,
+                            $route,
+                            static function (string $chunk) use (&$hasStarted, $onChunk): void {
+                                $hasStarted = true;
+
+                                if ($onChunk) {
+                                    $onChunk($chunk);
+                                }
+                            },
+                        );
+
+                        if ($route['type'] === 'direct') {
+                            $this->proxyRouter->markDirectSuccess($modelConfig);
+                        } else {
+                            $this->proxyRouter->markProxyResult($route['proxy'], true, $elapsedMs);
+                        }
+
+                        Log::info('AI stream route succeeded', [
+                            'requested_model' => $requestedModel,
+                            'used_model' => $modelConfig->key,
+                            'route' => $route['label'],
+                            'elapsed_ms' => $elapsedMs,
+                        ]);
+
+                        return;
+                    } catch (Throwable $exception) {
+                        $lastException = $exception;
+                        $errors[$modelConfig->key . ':' . $route['label']] = $exception->getMessage();
+
+                        if ($hasStarted) {
+                            Log::warning('AI stream interrupted after output started', [
+                                'model' => $modelConfig->key,
+                                'route' => $route['label'],
+                                'error' => $this->proxyRouter->sanitizeError($exception->getMessage()),
+                            ]);
+
+                            return;
+                        }
+
+                        if ($route['type'] === 'direct') {
+                            $this->proxyRouter->markDirectFailure($modelConfig, $exception);
+
+                            if (!$this->proxyRouter->shouldRetryThroughProxy($exception)) {
+                                break;
+                            }
+                        } else {
+                            $this->proxyRouter->markProxyResult(
+                                $route['proxy'],
+                                false,
+                                $exception instanceof AiRequestException ? $exception->elapsedMs : 0,
+                                $exception->getMessage(),
+                            );
+                        }
+                    }
+                }
+
+                if ($lastException) {
+                    throw $lastException;
+                }
+            } catch (Throwable $exception) {
+                $errors[$modelConfig->key] = $exception->getMessage();
+            }
+        }
+
+        Log::error('All AI models failed stream', ['errors' => $errors]);
     }
 
     private function normalizeHistory(array $messages): array

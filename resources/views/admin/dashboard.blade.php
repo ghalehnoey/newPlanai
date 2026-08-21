@@ -194,12 +194,16 @@
 </div>
 
 {{-- Top Users by Usage --}}
+@if(auth()->user()->role === 'manager')
 <div class="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden mb-6">
     <div class="px-5 py-4 border-b border-slate-100 flex items-center gap-2">
         <svg class="w-5 h-5 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/>
         </svg>
         <h2 class="font-semibold text-slate-800">پرمصرف‌ترین کاربران (۱۰ نفر اول)</h2>
+        <button type="button" id="loadTopUsersButton" onclick="loadTopUsers()" class="mr-auto rounded-lg bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-700 hover:bg-amber-100">
+            نمایش کاربران برتر
+        </button>
     </div>
     <div class="overflow-x-auto">
         <table class="w-full text-sm">
@@ -213,48 +217,13 @@
                     <th class="px-4 py-3 text-right font-medium">پلن</th>
                 </tr>
             </thead>
-            <tbody class="divide-y divide-slate-50">
-            @foreach($topUsers as $i => $tu)
-            <tr class="hover:bg-slate-50/50 transition-colors">
-                <td class="px-4 py-3">
-                    @if($i === 0)
-                        <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-amber-400 text-white text-xs font-bold">۱</span>
-                    @elseif($i === 1)
-                        <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-slate-300 text-white text-xs font-bold">۲</span>
-                    @elseif($i === 2)
-                        <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-amber-600 text-white text-xs font-bold">۳</span>
-                    @else
-                        <span class="text-slate-400 text-xs px-1">{{ $i + 1 }}</span>
-                    @endif
-                </td>
-                <td class="px-4 py-3">
-                    <div class="font-medium text-slate-800">{{ $tu->name ?: '—' }}</div>
-                    <div class="text-xs text-slate-400">#{{ $tu->id }}</div>
-                </td>
-                <td class="px-4 py-3 text-slate-600 font-mono text-xs">{{ $tu->phone ?: '—' }}</td>
-                <td class="px-4 py-3">
-                    <span class="inline-flex items-center gap-1 bg-indigo-50 text-indigo-700 px-2.5 py-1 rounded-lg font-semibold text-sm">
-                        {{ number_format($tu->total_messages) }}
-                        <span class="text-xs font-normal text-indigo-400">پیام</span>
-                    </span>
-                </td>
-                <td class="px-4 py-3 text-slate-700 font-medium">{{ number_format($tu->questions_used) }}</td>
-                <td class="px-4 py-3">
-                    @if($tu->plan_name)
-                        <span class="badge-active">{{ $tu->plan_name }}</span>
-                    @else
-                        <span class="text-slate-300 text-xs">—</span>
-                    @endif
-                </td>
-            </tr>
-            @endforeach
-            @if($topUsers->isEmpty())
-            <tr><td colspan="6" class="px-4 py-8 text-center text-slate-400">داده‌ای یافت نشد</td></tr>
-            @endif
+            <tbody id="topUsersBody" class="divide-y divide-slate-50">
+            <tr><td colspan="6" class="px-4 py-8 text-center text-slate-400">برای دریافت این گزارش روی «نمایش کاربران برتر» کلیک کنید.</td></tr>
             </tbody>
         </table>
     </div>
 </div>
+@endif
 
 @push('modals')
 {{-- Edit User Modal --}}
@@ -376,6 +345,31 @@
 
 @push('scripts')
 <script>
+async function loadTopUsers() {
+    const button = document.getElementById('loadTopUsersButton');
+    const body = document.getElementById('topUsersBody');
+    if (!button || !body) return;
+
+    button.disabled = true;
+    button.textContent = 'در حال دریافت...';
+    body.innerHTML = '<tr><td colspan="6" class="px-4 py-8 text-center text-slate-400">در حال محاسبه گزارش...</td></tr>';
+
+    try {
+        const response = await fetch(@json(route('admin.top-users')), {
+            headers: {'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest'}
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.message || 'دریافت گزارش ناموفق بود.');
+        body.innerHTML = data.html;
+        button.textContent = 'به‌روزرسانی گزارش';
+    } catch (error) {
+        body.innerHTML = '<tr><td colspan="6" class="px-4 py-8 text-center text-red-600">دریافت گزارش ناموفق بود؛ دوباره تلاش کنید.</td></tr>';
+        button.textContent = 'تلاش دوباره';
+    } finally {
+        button.disabled = false;
+    }
+}
+
 function openEditModal(id, name, phone, email, role, planId, expiresAt, questionsUsed) {
     document.getElementById('editUserName').textContent = name;
     document.getElementById('editPasswordForm').action = `/admin/users/${id}/change-password`;

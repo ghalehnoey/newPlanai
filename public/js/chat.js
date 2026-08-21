@@ -5,6 +5,10 @@ let currentConversationId = null;
 let isFirstAssistantMessage = true;
 let shouldAutoScroll = true;
 let selectedFiles = [];
+let isSendingMessage = false;
+const MAX_UPLOAD_FILES = 5;
+const MAX_UPLOAD_FILE_BYTES = 8 * 1024 * 1024;
+const ALLOWED_DOCUMENT_EXTENSIONS = ['pdf', 'txt', 'doc', 'docx'];
 const MESSAGE_PAGE_SIZE = 30;
 let oldestLoadedMessageId = null;
 let hasOlderMessages = false;
@@ -31,7 +35,16 @@ const modelMenuBackdrop = document.getElementById('modelMenuBackdrop');
 function updateFileUI() {
     if (selectedFiles.length > 0) {
         filePreviewContainer.classList.remove('hidden');
-        fileNameDisplay.textContent = selectedFiles.length === 1 ? selectedFiles[0].name : `${selectedFiles.length} فایل`;
+        const fileLabels = selectedFiles.map(file => {
+            const icon = attachmentExtension(file.name) === 'pdf'
+                ? 'PDF'
+                : (String(file.type || '').startsWith('image/') ? 'تصویر' : 'فایل');
+
+            return `${icon}: ${file.name} (${formatFileSize(file.size)})`;
+        });
+
+        fileNameDisplay.textContent = fileLabels.join(' • ');
+        fileNameDisplay.title = fileLabels.join('\n');
         if (fileInputBtn) fileInputBtn.classList.add('bg-indigo-100', 'text-indigo-600');
     } else {
         filePreviewContainer.classList.add('hidden');
@@ -78,6 +91,32 @@ function selectModel(modelKey, supportsFiles) {
     }
     
     console.log('✅ مدل انتخاب شد:', currentModel, '| پشتیبانی از فایل:', currentModelSupportsFiles);
+}
+
+function formatFileSize(bytes) {
+    if (bytes < 1024) return `${bytes} بایت`;
+    if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} کیلوبایت`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} مگابایت`;
+}
+
+function setSendingState(isSending) {
+    isSendingMessage = isSending;
+
+    [sendBtn, fileInputBtn].forEach(button => {
+        if (!button) return;
+        button.disabled = isSending;
+        button.classList.toggle('opacity-50', isSending);
+        button.classList.toggle('cursor-not-allowed', isSending);
+    });
+}
+
+function attachmentExtension(fileName) {
+    return String(fileName || '').split('.').pop().toLowerCase();
+}
+
+function isAllowedAttachment(file) {
+    return String(file.type || '').startsWith('image/')
+        || ALLOWED_DOCUMENT_EXTENSIONS.includes(attachmentExtension(file.name));
 }
 
 function toggleModelMenu(forceOpen = null) {
@@ -231,6 +270,8 @@ function friendlyAiUnavailableMessage() {
 
 // ==================== ارسال پیام با استریم ====================
 async function sendMessage() {
+    if (isSendingMessage) return;
+
     if (!currentModel) {
         alert('لطفاً یک مدل انتخاب کنید.');
         return;
@@ -238,6 +279,8 @@ async function sendMessage() {
     
     const text = questionInput.value.trim();
     if (!text && selectedFiles.length === 0) return;
+
+    setSendingState(true);
     
     // نمایش پیام کاربر
     const tempFiles = selectedFiles.map(f => ({
@@ -279,7 +322,8 @@ async function sendMessage() {
         
         if (!response.ok) {
             let errorData = await response.json().catch(() => ({}));
-            const serverMessage = String(errorData.error || '');
+            const firstValidationError = Object.values(errorData.errors || {}).flat()[0] || '';
+            const serverMessage = String(errorData.error || firstValidationError || errorData.message || '');
             const shouldShowServerMessage = response.status === 403 || response.status === 422;
             renderAssistantMessage(typingId, shouldShowServerMessage ? serverMessage : friendlyAiUnavailableMessage());
             return;
@@ -324,6 +368,8 @@ async function sendMessage() {
     } catch (error) {
         console.error('Send message error:', error);
         renderAssistantMessage(typingId, friendlyAiUnavailableMessage());
+    } finally {
+        setSendingState(false);
     }
 }
 
@@ -468,9 +514,33 @@ document.addEventListener('keydown', (e) => {
 if (fileInput) {
     fileInput.addEventListener('change', (e) => {
         const files = Array.from(e.target.files);
-        files.forEach(f => selectedFiles.push(f));
+        const rejected = [];
+
+        files.forEach(file => {
+            if (selectedFiles.length >= MAX_UPLOAD_FILES) {
+                rejected.push(`حداکثر ${MAX_UPLOAD_FILES} فایل را می‌توانید هم‌زمان بفرستید.`);
+                return;
+            }
+
+            if (!isAllowedAttachment(file)) {
+                rejected.push(`فرمت فایل «${file.name}» پشتیبانی نمی‌شود.`);
+                return;
+            }
+
+            if (file.size > MAX_UPLOAD_FILE_BYTES) {
+                rejected.push(`حجم فایل «${file.name}» باید حداکثر ۸ مگابایت باشد.`);
+                return;
+            }
+
+            selectedFiles.push(file);
+        });
+
         updateFileUI();
         e.target.value = '';
+
+        if (rejected.length > 0) {
+            alert([...new Set(rejected)].join('\n'));
+        }
     });
 }
 

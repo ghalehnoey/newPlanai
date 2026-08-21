@@ -256,8 +256,8 @@
                     </div>
                 </div>
                 <div id="fileUploadContainer" class="hidden">
-                    <input type="file" id="fileInput" class="hidden" multiple accept="image/*,.txt,.doc,.docx,.pdf">
-                    <button id="fileInputBtn" class="p-2 rounded-xl bg-slate-100 text-slate-600 hover:bg-slate-200 transition-smooth" title="ضمیمه فایل">
+                    <input type="file" id="fileInput" class="hidden" multiple accept="image/*,application/pdf,.pdf,.txt,.doc,.docx">
+                    <button id="fileInputBtn" class="p-2 rounded-xl bg-slate-100 text-slate-600 hover:bg-slate-200 transition-smooth" title="ارسال تصویر، PDF یا فایل متنی">
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
                         </svg>
@@ -265,8 +265,11 @@
                 </div>
             </div>
 
-            <div id="filePreviewContainer" class="hidden mb-2 p-2 bg-indigo-50/50 rounded-xl flex justify-between items-center text-sm border border-indigo-100">
-                <span id="fileNameDisplay" class="text-indigo-700 truncate"></span>
+            <div id="filePreviewContainer" class="hidden mb-2 p-2 bg-indigo-50/50 rounded-xl flex justify-between items-center gap-3 text-sm border border-indigo-100">
+                <div class="min-w-0">
+                    <span id="fileNameDisplay" class="block text-indigo-700 truncate"></span>
+                    <span class="block text-[10px] text-indigo-500 mt-0.5">PDF تا ۲۰۰ صفحه؛ فایل اسکن‌شده مجموعاً تا ۱۲ صفحه؛ هر فایل حداکثر ۸ مگابایت</span>
+                </div>
                 <button id="removeFileBtn" class="text-rose-500 text-xs font-bold px-2">حذف</button>
             </div>
 

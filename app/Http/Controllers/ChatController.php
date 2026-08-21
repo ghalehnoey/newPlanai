@@ -17,6 +17,9 @@ use Illuminate\Support\Facades\Log;
 
 class ChatController extends BaseController
 {
+    private const MAX_PDF_PAGES = 200;
+    private const MAX_SCANNED_PDF_PAGES_PER_REQUEST = 12;
+
     public function __construct(
         private SystemPromptService $systemPromptService,
         private AiApiService        $aiApiService,
@@ -45,15 +48,17 @@ class ChatController extends BaseController
     {
         Log::info('CHAT REQUEST START', [
             'model' => $request->model,
-            'question' => $request->question,
-            'has_files' => $request->hasFile('files')
+            'question_length' => mb_strlen((string) $request->question),
+            'has_files' => $request->hasFile('files'),
+            'file_count' => count((array) $request->file('files', [])),
         ]);
 
         $request->validate([
             'conversation_id' => 'nullable|exists:conversations,id',
             'question'        => 'nullable|string',
             'model'           => 'required|string',
-            'files.*'         => 'nullable|mimes:jpg,jpeg,png,webp,gif,txt,doc,docx,pdf|max:8192',
+            'files'           => 'nullable|array|max:5',
+            'files.*'         => 'file|mimes:jpg,jpeg,png,webp,gif,txt,doc,docx,pdf|max:8192',
         ]);
 
         $modelKey = $request->model;
@@ -99,6 +104,48 @@ class ChatController extends BaseController
             return response()->json(['error' => $error], 403);
         }
 
+        $preparedFileTexts = [];
+        $scannedPdfPages = 0;
+
+        foreach ((array) $request->file('files', []) as $index => $file) {
+            $extension = strtolower($file->getClientOriginalExtension());
+            $pageCount = null;
+
+            if (!in_array($extension, ['txt', 'doc', 'docx', 'pdf'], true)) {
+                continue;
+            }
+
+            if ($extension === 'pdf') {
+                $pageCount = $this->fileService->pdfPageCount($file);
+
+                if ($pageCount !== null && $pageCount > self::MAX_PDF_PAGES) {
+                    return response()->json([
+                        'error' => 'این PDF بیش از ۲۰۰ صفحه دارد. لطفاً آن را به چند فایل کوچک‌تر تقسیم و دوباره ارسال کنید.'
+                    ], 422);
+                }
+            }
+
+            $extractedText = $this->fileService->extractText($file, $file->getMimeType());
+
+            if ($extension === 'pdf' && trim((string) $extractedText) === '') {
+                $scannedPdfPages += $pageCount ?? 1;
+
+                if ($scannedPdfPages > self::MAX_SCANNED_PDF_PAGES_PER_REQUEST) {
+                    return response()->json([
+                        'error' => 'PDF تصویری یا اسکن‌شده در هر درخواست حداکثر می‌تواند مجموعاً ۱۲ صفحه داشته باشد. لطفاً فایل را تقسیم کنید.'
+                    ], 422);
+                }
+
+                if (empty($this->fileService->renderPdfPagesAsImages($file, 1))) {
+                    return response()->json([
+                        'error' => 'صفحه‌های این PDF قابل پردازش نیستند؛ فایل احتمالاً رمزدار یا خراب است.'
+                    ], 422);
+                }
+            }
+
+            $preparedFileTexts[$index] = $extractedText;
+        }
+
         if ($request->filled('conversation_id')) {
             $conversation = Conversation::where('id', $request->conversation_id)
                 ->where('user_id', $user->id)
@@ -120,18 +167,43 @@ class ChatController extends BaseController
 
         $uploadedFileModels = [];
         if ($request->hasFile('files')) {
-            foreach ($request->file('files') as $file) {
+            foreach ($request->file('files') as $index => $file) {
+                $extension = strtolower($file->getClientOriginalExtension());
                 $path = $file->store('chat_files', 'public');
                 $uploadedFileModels[] = UploadedFile::create([
                     'message_id'    => $userMessage->id,
                     'user_id'       => $user->id,
+                    'conversation_id' => $conversation->id,
                     'path'          => $path,
                     'stored_name'   => basename($path),
                     'original_name' => $file->getClientOriginalName(),
                     'mime_type'     => $file->getMimeType(),
                     'size'          => $file->getSize(),
+                    'type'          => str_starts_with((string) $file->getMimeType(), 'image/')
+                        ? 'image'
+                        : match ($extension) {
+                            'pdf' => 'pdf',
+                            'txt' => 'text',
+                            default => 'document',
+                        },
+                    'extracted_text' => $preparedFileTexts[$index] ?? null,
                 ]);
             }
+
+            $userMessage->files()->syncWithoutDetaching(
+                collect($uploadedFileModels)->pluck('id')->all()
+            );
+        }
+
+        $aiFileModels = $uploadedFileModels;
+
+        if (empty($aiFileModels) && $aiModel->supports_files) {
+            $aiFileModels = UploadedFile::where('conversation_id', $conversation->id)
+                ->whereIn('type', ['pdf', 'document', 'text'])
+                ->latest('id')
+                ->limit(3)
+                ->get()
+                ->all();
         }
 
         $systemPrompt = (string) $this->systemPromptService->getSystemPrompt();
@@ -149,6 +221,7 @@ class ChatController extends BaseController
         return response()->stream(function () use (
             $conversation,
             $messageText,
+            $aiFileModels,
             $uploadedFileModels,
             $systemPrompt,
             $previousChatMessages,
@@ -171,7 +244,7 @@ class ChatController extends BaseController
                     $modelKey,
                     $systemPrompt,
                     $previousChatMessages,
-                    $uploadedFileModels,
+                    $aiFileModels,
                     function (string $chunk) use (&$assistantAnswer) {
                         $assistantAnswer .= $chunk;
                         echo $chunk;
@@ -202,9 +275,13 @@ class ChatController extends BaseController
                     'model'           => $modelKey,
                 ]);
 
-                if ($conversation->title === 'مکالمه جدید' && trim($messageText) !== '') {
+                $titleSource = trim($messageText) !== ''
+                    ? trim($messageText)
+                    : ($uploadedFileModels[0]->original_name ?? 'تحلیل فایل');
+
+                if ($conversation->title === 'مکالمه جدید' && $titleSource !== '') {
                     $conversation->update([
-                        'title' => mb_strimwidth($messageText, 0, 60, '...', 'UTF-8')
+                        'title' => mb_strimwidth($titleSource, 0, 60, '...', 'UTF-8')
                     ]);
                 }
 
