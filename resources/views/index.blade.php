@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>وکیل هوش مصنوعی | مشاور حقوقی هوشمند</title>
+    <meta name="chat-user-id" content="{{ auth()->id() }}">
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <script>(function(){if(localStorage.getItem("darkMode")==="true")document.documentElement.classList.add("dark");})()</script>
     
@@ -12,6 +13,12 @@
     <script src="{{ asset('js/marked.min.js') }}"></script>
     
     <style>
+        .chat-status { border:1px solid #c7d2fe; background:#eef2ff; color:#3730a3; border-radius:12px; padding:10px 12px; margin-bottom:10px; font-size:12px; line-height:1.9; overflow-wrap:anywhere; }
+        .chat-status[data-kind="error"] { background:#fff7ed; color:#9a3412; border-color:#fed7aa; }
+        .chat-status-action { display:inline-block; font-weight:700; text-decoration:underline; margin-inline-start:12px; cursor:pointer; }
+        .dark .chat-status { background:#1e293b; color:#c7d2fe; border-color:#475569; }
+        .dark .chat-status[data-kind="error"] { color:#fed7aa; }
+        [hidden] { display:none !important; }
         * { font-family: 'Vazirmatn', sans-serif; }
         
         ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -208,6 +215,8 @@
 
     <footer class="border-t bg-white/95 backdrop-blur-sm">
         <div class="max-w-3xl mx-auto px-4 py-3 composer-wrap">
+            <div id="chatStatus" class="chat-status" role="status" aria-live="polite" hidden></div>
+            <button id="stopChatBtn" type="button" class="text-xs text-slate-600 border rounded-xl px-3 py-1 mb-2" hidden>توقف دریافت پاسخ</button>
             <div class="flex items-center justify-between gap-3 mb-3 relative">
                 <div class="relative flex-1 min-w-0">
                     <button id="selectedModelButton" type="button" class="w-full sm:w-auto max-w-full flex items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 shadow-sm hover:bg-white transition-smooth">
@@ -275,7 +284,7 @@
 
             <div class="flex items-end gap-2 bg-white rounded-2xl border border-slate-200 shadow-sm focus-within:ring-2 focus-within:ring-indigo-300 transition-smooth">
                 <textarea id="question" rows="1" class="flex-1 p-3 resize-none bg-transparent text-slate-700 placeholder-slate-400 focus:outline-none text-sm" placeholder="سؤال حقوقی خود را بپرسید..."></textarea>
-                <button id="sendBtn" class="m-2 p-2 bg-indigo-500 text-white rounded-xl hover:bg-indigo-600 transition-smooth">
+                <button id="sendBtn" type="button" aria-label="ارسال پیام" class="m-2 p-2 bg-indigo-500 text-white rounded-xl hover:bg-indigo-600 transition-smooth">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
                     </svg>

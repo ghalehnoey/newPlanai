@@ -561,6 +561,68 @@ class AiApiService
                 : 'max_tokens';
     }
 
+    private function isDeepSeekV4(AiModel $model): bool
+    {
+        return strtolower((string) $model->provider) === 'deepseek'
+            && str_starts_with(strtolower((string) $model->model_mapping), 'deepseek-v4-');
+    }
+
+    /** @param array<string, mixed> $body */
+    private function applyModelRequestOptions(
+        AiModel $model,
+        array $body,
+        int $maxTokens,
+        bool $preferDirectAnswer = false
+    ): array
+    {
+        $body[$this->completionTokenField($model)] = $maxTokens;
+
+        if ($this->isDeepSeekV4($model)) {
+            unset(
+                $body['temperature'],
+                $body['top_p'],
+                $body['presence_penalty'],
+                $body['frequency_penalty'],
+            );
+
+            // Direct-answer requests must return visible content within the
+            // site's response budget. Thinking can otherwise consume the
+            // whole allowance and finish with an empty content field.
+            if ($preferDirectAnswer || in_array((string) $model->key, ['chatgpt', 'chatgpt-vision'], true)) {
+                $body['thinking'] = ['type' => 'disabled'];
+                unset($body['reasoning_effort']);
+            } else {
+                $body['thinking'] = ['type' => 'enabled'];
+                $body['reasoning_effort'] = 'high';
+            }
+        }
+
+        return $body;
+    }
+
+    private function shouldPreferDirectLegalAnswer(
+        AiModel $model,
+        string $question,
+        string $systemPrompt
+    ): bool {
+        if (!$this->isDeepSeekV4($model) || (string) $model->key !== 'deepseek') {
+            return false;
+        }
+
+        $text = $systemPrompt . ' ' . $question;
+
+        foreach ([
+            'حقوق', 'قانون', 'قضایی', 'دادگاه', 'دادسرا', 'ماده', 'تبصره',
+            'سند', 'ثبت', 'قرارداد', 'دعوا', 'شکایت', 'جرم', 'وکیل', 'مالکیت',
+        ] as $legalTerm) {
+            if (str_contains($text, $legalTerm)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /**
      * @param array<string, mixed> $body
      * @param array{type:string,label:string,proxy:?AiProxyServer,proxy_url:?string} $route
@@ -571,7 +633,8 @@ class AiApiService
         string $apiKey,
         array $body,
         array $route,
-        ?callable $onChunk
+        ?callable $onChunk,
+        int $timeoutSeconds = 120,
     ): int {
         $body['stream'] = true;
         $payload = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
@@ -583,14 +646,27 @@ class AiApiService
         $buffer = '';
         $rawBody = '';
         $receivedContent = false;
-        $processLine = static function (string $line) use (&$receivedContent, $onChunk): void {
+        $finished = false;
+        $streamError = null;
+        $retryAfter = null;
+        $processLine = static function (string $line) use (&$receivedContent, &$finished, &$streamError, $onChunk): void {
             $line = trim($line);
 
-            if ($line === '' || $line === 'data: [DONE]' || !str_starts_with($line, 'data: ')) {
+            if ($line === 'data: [DONE]') {
+                $finished = true;
+                return;
+            }
+            if ($line === '' || !str_starts_with($line, 'data: ')) {
                 return;
             }
 
             $data = json_decode(substr($line, 6), true);
+            if (isset($data['error'])) {
+                $streamError = 'upstream_stream_error';
+            }
+            if (isset($data['choices'][0]['finish_reason'])) {
+                $finished = true;
+            }
             $chunk = $data['choices'][0]['delta']['content'] ?? '';
 
             if (is_string($chunk) && $chunk !== '') {
@@ -614,14 +690,26 @@ class AiApiService
                 'Content-Length: ' . strlen($payload),
             ],
             CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_CONNECTTIMEOUT => min(30, max(5, (int) ($model->timeout_seconds ?? 120))),
-            CURLOPT_TIMEOUT => max(30, (int) ($model->timeout_seconds ?? 120)),
+            CURLOPT_CONNECTTIMEOUT => min(15, max(1, $timeoutSeconds)),
+            CURLOPT_TIMEOUT => max(1, min($timeoutSeconds, (int) ($model->timeout_seconds ?: 120))),
+            CURLOPT_HEADERFUNCTION => static function ($curl, string $header) use (&$retryAfter): int {
+                if (stripos($header, 'Retry-After:') === 0) {
+                    $value = trim(substr($header, 12));
+                    $retryAfter = ctype_digit($value) ? (int) $value : max(0, (int) strtotime($value) - time());
+                }
+                return strlen($header);
+            },
+            CURLOPT_NOPROGRESS => false,
+            CURLOPT_XFERINFOFUNCTION => static fn() => connection_aborted() ? 1 : 0,
             CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
             CURLOPT_WRITEFUNCTION => static function ($curl, string $chunk) use (&$buffer, &$rawBody, $processLine): int {
                 if (strlen($rawBody) < 20000) {
                     $rawBody .= substr($chunk, 0, 20000 - strlen($rawBody));
                 }
 
+                if (strlen($buffer) + strlen($chunk) > 1024 * 1024) {
+                    return 0;
+                }
                 $buffer .= $chunk;
 
                 while (($position = strpos($buffer, "\n")) !== false) {
@@ -656,6 +744,7 @@ class AiApiService
                 $curlErrno,
                 $elapsedMs,
                 $primaryIp,
+                $retryAfter,
             );
         }
 
@@ -667,7 +756,12 @@ class AiApiService
                 0,
                 $elapsedMs,
                 $primaryIp,
+                $retryAfter,
             );
+        }
+
+        if ($streamError !== null || ($receivedContent && !$finished)) {
+            throw new AiRequestException('upstream_incomplete_stream', $httpCode, 18, $elapsedMs, $primaryIp);
         }
 
         if (!$receivedContent) {
@@ -711,7 +805,7 @@ class AiApiService
             'temperature' => 0,
             'stream' => false,
         ];
-        $body[$this->completionTokenField($model)] = 10;
+        $body = $this->applyModelRequestOptions($model, $body, $this->isDeepSeekV4($model) ? 256 : 32);
 
         try {
             $result = $this->requestJson($model, $provider['base_url'], $provider['api_key'], $body, $route);
@@ -851,7 +945,9 @@ class AiApiService
             }
 
             if (str_starts_with($mime, 'image/')) {
-                $base64 = base64_encode(file_get_contents($fullPath));
+                [$imageBytes, $mime] = $this->resizeImageForProxy($fullPath, $mime);
+                $base64 = base64_encode($imageBytes);
+                unset($imageBytes);
 
                 $userContent[] = [
                     'type' => 'image_url',
@@ -1060,7 +1156,8 @@ class AiApiService
         string $systemPrompt,
         array $previousChatMessages = [],
         array $uploadedFiles = [],
-        callable $onChunk = null
+        callable $onChunk = null,
+        ?callable $onStatus = null,
     ): void {
         $history = $this->normalizeHistory($previousChatMessages);
         $needsFiles = !empty($uploadedFiles);
@@ -1076,6 +1173,7 @@ class AiApiService
             $uploadedFiles,
             $chain,
             $onChunk,
+            $onStatus,
         );
 
         return;
@@ -1246,7 +1344,24 @@ class AiApiService
                     'temperature' => 0.7,
                     'stream' => false,
                 ];
-                $body[$this->completionTokenField($modelConfig)] = 4000;
+                $preferDirectAnswer = $this->shouldPreferDirectLegalAnswer(
+                    $modelConfig,
+                    $message,
+                    $systemPrompt,
+                );
+                $body = $this->applyModelRequestOptions(
+                    $modelConfig,
+                    $body,
+                    4000,
+                    $preferDirectAnswer,
+                );
+
+                if ($preferDirectAnswer) {
+                    Log::info('DeepSeek adaptive direct-answer mode selected', [
+                        'model' => $modelConfig->key,
+                        'request_type' => 'legal',
+                    ]);
+                }
                 $routes = $this->proxyRouter->routesFor($modelConfig);
 
                 if ($routes === []) {
@@ -1341,107 +1456,105 @@ class AiApiService
         array $uploadedFiles,
         array $chain,
         ?callable $onChunk,
+        ?callable $onStatus = null,
     ): void {
         $needsFiles = $uploadedFiles !== [];
-        $errors = [];
         $hasStarted = false;
+        $lastError = new RuntimeException('No AI response');
+        $deadline = microtime(true) + 150;
+        $contextNoticeSent = false;
 
         foreach ($chain as $modelConfig) {
+            if (connection_aborted() || microtime(true) >= $deadline) {
+                break;
+            }
             try {
                 $provider = $this->getProviderConfigByModel($modelConfig);
-
                 if (!$provider['api_key']) {
-                    throw new RuntimeException("کلید API برای مدل {$modelConfig->key} تنظیم نشده است.");
+                    throw new RuntimeException('AI credentials unavailable');
                 }
-
+                if ($onStatus) {
+                    $onStatus('model_selected', ['key' => $modelConfig->key, 'name' => $modelConfig->name]);
+                }
                 $messages = ($needsFiles && $modelConfig->supports_files)
                     ? $this->buildMessagesWithFiles($systemPrompt, $history, $question, $uploadedFiles)
                     : $this->buildMessages($systemPrompt, $history, $question);
+                $prepared = ChatReliability::prepareMessages($messages);
+                if ($prepared['trimmed'] && !$contextNoticeSent && $onStatus) {
+                    $onStatus('context_trimmed');
+                    $contextNoticeSent = true;
+                }
                 $body = [
                     'model' => $this->resolveModel($modelConfig),
-                    'messages' => $messages,
+                    'messages' => $prepared['messages'],
                     'temperature' => 0.7,
                 ];
-                $body[$this->completionTokenField($modelConfig)] = 4000;
-                $routes = $this->proxyRouter->routesFor($modelConfig);
-
-                if ($routes === []) {
-                    throw new RuntimeException("برای مدل {$modelConfig->key} مسیر پراکسی فعالی وجود ندارد.");
-                }
-
-                $lastException = null;
-
-                foreach ($routes as $route) {
-                    try {
-                        $elapsedMs = $this->requestStream(
-                            $modelConfig,
-                            $provider['base_url'],
-                            $provider['api_key'],
-                            $body,
-                            $route,
-                            static function (string $chunk) use (&$hasStarted, $onChunk): void {
-                                $hasStarted = true;
-
-                                if ($onChunk) {
-                                    $onChunk($chunk);
-                                }
-                            },
-                        );
-
-                        if ($route['type'] === 'direct') {
-                            $this->proxyRouter->markDirectSuccess($modelConfig);
-                        } else {
-                            $this->proxyRouter->markProxyResult($route['proxy'], true, $elapsedMs);
+                $body = $this->applyModelRequestOptions(
+                    $modelConfig,
+                    $body,
+                    4000,
+                    $this->shouldPreferDirectLegalAnswer($modelConfig, $question, $systemPrompt),
+                );
+                foreach ($this->proxyRouter->routesFor($modelConfig) as $route) {
+                    for ($attempt = 0; $attempt < 2; $attempt++) {
+                        $remaining = (int) floor($deadline - microtime(true));
+                        if ($remaining <= 0 || connection_aborted()) {
+                            break 3;
                         }
-
-                        Log::info('AI stream route succeeded', [
-                            'requested_model' => $requestedModel,
-                            'used_model' => $modelConfig->key,
-                            'route' => $route['label'],
-                            'elapsed_ms' => $elapsedMs,
-                        ]);
-
-                        return;
-                    } catch (Throwable $exception) {
-                        $lastException = $exception;
-                        $errors[$modelConfig->key . ':' . $route['label']] = $exception->getMessage();
-
-                        if ($hasStarted) {
-                            Log::warning('AI stream interrupted after output started', [
-                                'model' => $modelConfig->key,
-                                'route' => $route['label'],
-                                'error' => $this->proxyRouter->sanitizeError($exception->getMessage()),
-                            ]);
-
-                            return;
-                        }
-
-                        if ($route['type'] === 'direct') {
-                            $this->proxyRouter->markDirectFailure($modelConfig, $exception);
-
-                            if (!$this->proxyRouter->shouldRetryThroughProxy($exception)) {
-                                break;
-                            }
-                        } else {
-                            $this->proxyRouter->markProxyResult(
-                                $route['proxy'],
-                                false,
-                                $exception instanceof AiRequestException ? $exception->elapsedMs : 0,
-                                $exception->getMessage(),
+                        try {
+                            $elapsedMs = $this->requestStream(
+                                $modelConfig,
+                                $provider['base_url'],
+                                $provider['api_key'],
+                                $body,
+                                $route,
+                                static function (string $chunk) use (&$hasStarted, $onChunk): void {
+                                    $hasStarted = true;
+                                    if ($onChunk) {
+                                        $onChunk($chunk);
+                                    }
+                                },
+                                min(60, $remaining),
                             );
+                            if ($route['type'] === 'direct') {
+                                $this->proxyRouter->markDirectSuccess($modelConfig);
+                            } else {
+                                $this->proxyRouter->markProxyResult($route['proxy'], true, $elapsedMs);
+                            }
+                            return;
+                        } catch (Throwable $error) {
+                            $lastError = $error;
+                            ChatReliability::report($error, ['model' => $modelConfig->key, 'stage' => 'upstream', 'partial' => $hasStarted]);
+                            if ($hasStarted || connection_aborted()) {
+                                throw $error;
+                            }
+                            $delay = $error instanceof AiRequestException
+                                ? ($error->retryAfterSeconds ?? 1)
+                                : 1;
+                            if ($attempt === 0 && ChatReliability::canRetry($error)
+                                && $delay <= 5 && microtime(true) + $delay + 2 < $deadline) {
+                                if ($onStatus) {
+                                    $onStatus('retrying');
+                                }
+                                usleep(max(1, $delay) * 1000000 + random_int(0, 200000));
+                                continue;
+                            }
+                            if ($route['type'] === 'direct') {
+                                $this->proxyRouter->markDirectFailure($modelConfig, $error);
+                            }
+                            break;
                         }
                     }
                 }
-
-                if ($lastException) {
-                    throw $lastException;
+            } catch (Throwable $error) {
+                $lastError = $error;
+                if ($hasStarted || $error instanceof \LengthException || connection_aborted()) {
+                    throw $error;
                 }
-            } catch (Throwable $exception) {
-                $errors[$modelConfig->key] = $exception->getMessage();
+                ChatReliability::report($error, ['model' => $modelConfig->key, 'stage' => 'fallback']);
             }
         }
-
-        Log::error('All AI models failed stream', ['errors' => $errors]);
+        throw $lastError;
     }
 
     private function normalizeHistory(array $messages): array

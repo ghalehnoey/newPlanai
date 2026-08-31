@@ -9,6 +9,9 @@ use Illuminate\Support\Str;
 use Spatie\PdfToText\Pdf;
 use Symfony\Component\Process\Process;
 use Throwable;
+use Illuminate\Validation\ValidationException;
+use XMLReader;
+use ZipArchive;
 
 class FileService
 {
@@ -54,29 +57,20 @@ class FileService
 
         try {
             if ($extension === 'txt') {
+                if (filesize($filePath) > 240000) {
+                    throw ValidationException::withMessages(['files' => 'متن فایل طولانی است؛ لطفاً آن را به بخش‌های کوچک‌تر تقسیم کنید.']);
+                }
                 return $this->normalizeExtractedText((string) file_get_contents($filePath));
             }
 
-            if (in_array($extension, ['doc', 'docx'], true)
-                && class_exists(\PhpOffice\PhpWord\IOFactory::class)) {
-                $phpWord = \PhpOffice\PhpWord\IOFactory::load($filePath);
-                $text = '';
+            if ($extension === 'docx') {
+                return $this->extractDocxText($filePath);
+            }
 
-                foreach ($phpWord->getSections() as $section) {
-                    foreach ($section->getElements() as $element) {
-                        if (method_exists($element, 'getText')) {
-                            $text .= $element->getText() . "\n";
-                        } elseif (method_exists($element, 'getElements')) {
-                            foreach ($element->getElements() as $childElement) {
-                                if (method_exists($childElement, 'getText')) {
-                                    $text .= $childElement->getText() . "\n";
-                                }
-                            }
-                        }
-                    }
-                }
-
-                return $this->normalizeExtractedText($text);
+            if ($extension === 'doc') {
+                throw ValidationException::withMessages([
+                    'files' => 'لطفاً فایل Word قدیمی (DOC) را به DOCX یا PDF تبدیل و دوباره ارسال کنید.',
+                ]);
             }
 
             if ($extension === 'pdf' && class_exists(Pdf::class)) {
@@ -88,6 +82,8 @@ class FileService
 
                 return $this->normalizeExtractedText($text);
             }
+        } catch (ValidationException $e) {
+            throw $e;
         } catch (Throwable $e) {
             Log::error('File text extraction failed', [
                 'path' => $filePath,
@@ -98,6 +94,67 @@ class FileService
         }
 
         return null;
+    }
+
+    private function extractDocxText(string $path): ?string
+    {
+        $reject = static fn(string $message) => ValidationException::withMessages(['files' => $message]);
+        $zip = new ZipArchive();
+        if ($zip->open($path) !== true) {
+            throw $reject('فایل Word قابل خواندن نیست؛ لطفاً نسخه سالم DOCX یا PDF را ارسال کنید.');
+        }
+        try {
+            $stat = $zip->statName('word/document.xml');
+            $total = 0;
+            if (!$stat || $zip->numFiles > 2000 || $stat['size'] > 8 * 1024 * 1024) {
+                throw $reject('ساختار این Word بسیار بزرگ یا نامعتبر است. لطفاً فایل را به چند بخش کوچک‌تر تقسیم کنید.');
+            }
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $total += (int) ($zip->statIndex($i)['size'] ?? 0);
+                if ($total > 64 * 1024 * 1024) {
+                    throw $reject('حجم بازشدهٔ فایل Word زیاد است. لطفاً تصاویر اضافی را حذف یا فایل را تقسیم کنید.');
+                }
+            }
+            $xml = $zip->getFromName('word/document.xml', 8 * 1024 * 1024 + 1);
+        } finally {
+            $zip->close();
+        }
+        if (!is_string($xml) || stripos($xml, '<!DOCTYPE') !== false) {
+            throw $reject('ساختار این فایل Word پشتیبانی نمی‌شود. لطفاً آن را دوباره با Word ذخیره کنید.');
+        }
+        $previousErrors = libxml_use_internal_errors(true);
+        $reader = new XMLReader();
+        $text = '';
+        $nodes = 0;
+        try {
+            if (!$reader->XML($xml, null, LIBXML_NONET | LIBXML_COMPACT)) {
+                throw $reject('محتوای فایل Word قابل خواندن نیست.');
+            }
+            $reader->setParserProperty(XMLReader::SUBST_ENTITIES, false);
+            while ($reader->read()) {
+                if (++$nodes > 200000) {
+                    throw $reject('این Word پیچیده یا بسیار بزرگ است. لطفاً آن را تقسیم کنید.');
+                }
+                if ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 't') {
+                    $text .= $reader->readString();
+                } elseif ($reader->nodeType === XMLReader::END_ELEMENT && in_array($reader->localName, ['p', 'tr'], true)) {
+                    $text .= "\n";
+                } elseif ($reader->nodeType === XMLReader::ELEMENT && in_array($reader->localName, ['tab', 'br'], true)) {
+                    $text .= $reader->localName === 'tab' ? "\t" : "\n";
+                }
+                if (strlen($text) > 240000) {
+                    throw $reject('متن Word برای یک درخواست زیاد است. لطفاً آن را به چند بخش کوچک‌تر تقسیم کنید.');
+                }
+            }
+            if (libxml_get_errors()) {
+                throw $reject('فایل Word ناقص یا خراب است؛ لطفاً نسخه سالم آن را ارسال کنید.');
+            }
+        } finally {
+            $reader->close();
+            libxml_clear_errors();
+            libxml_use_internal_errors($previousErrors);
+        }
+        return $this->normalizeExtractedText($text);
     }
 
     public function pdfPageCount(HttpUploadedFile|string $file): ?int

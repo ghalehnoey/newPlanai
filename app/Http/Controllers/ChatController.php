@@ -14,6 +14,11 @@ use GuzzleHttp\Client;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller as BaseController;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Str;
+use App\Services\ChatReliability;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class ChatController extends BaseController
 {
@@ -46,6 +51,46 @@ class ChatController extends BaseController
 
     public function sendMessage(Request $request)
     {
+        $requestId = (string) Str::uuid();
+        $request->attributes->set('chat_request_id', $requestId);
+        $lock = null;
+        $streamOwnsLock = false;
+        try {
+            if ($request->filled('retry_message_id')) {
+                $lock = Cache::lock('chat-retry:' . auth()->id() . ':' . (int) $request->input('retry_message_id'), 300);
+                if (!$lock->get()) {
+                    return response()->json(['code' => 'request_in_progress', 'error' => 'همین پیام هنوز در حال پردازش است. کمی صبر کنید.'], 409);
+                }
+            }
+            $response = $this->processMessage($request);
+            $response->headers->set('X-Request-Id', $requestId);
+            if ($lock && $response instanceof StreamedResponse) {
+                $callback = $response->getCallback();
+                $response->setCallback(static function () use ($callback, $lock) {
+                    try {
+                        $callback();
+                    } finally {
+                        $lock->release();
+                    }
+                });
+                $streamOwnsLock = true;
+            }
+            return $response;
+        } catch (\Throwable $error) {
+            if (!$error instanceof \Illuminate\Validation\ValidationException
+                && !$error instanceof \Symfony\Component\HttpKernel\Exception\HttpExceptionInterface) {
+                ChatReliability::report($error, ['request_id' => $requestId, 'stage' => 'prepare_request']);
+            }
+            throw $error;
+        } finally {
+            if ($lock && !$streamOwnsLock) {
+                $lock->release();
+            }
+        }
+    }
+
+    private function processMessage(Request $request)
+    {
         Log::info('CHAT REQUEST START', [
             'model' => $request->model,
             'question_length' => mb_strlen((string) $request->question),
@@ -54,11 +99,18 @@ class ChatController extends BaseController
         ]);
 
         $request->validate([
-            'conversation_id' => 'nullable|exists:conversations,id',
-            'question'        => 'nullable|string',
+            'conversation_id' => 'nullable|required_with:retry_message_id|exists:conversations,id',
+            'question'        => 'nullable|string|max:12000',
+            'retry_message_id' => 'nullable|integer|min:1',
             'model'           => 'required|string',
             'files'           => 'nullable|array|max:5',
             'files.*'         => 'file|mimes:jpg,jpeg,png,webp,gif,txt,doc,docx,pdf|max:8192',
+        ], [
+            'question.max' => 'متن سؤال طولانی است. لطفاً آن را به چند بخش کوچک‌تر تقسیم کنید.',
+            'files.max' => 'در هر پیام حداکثر ۵ فایل ارسال کنید.',
+            'files.*.max' => 'حجم هر فایل باید حداکثر ۸ مگابایت باشد.',
+            'files.*.mimes' => 'این فرمت فایل پشتیبانی نمی‌شود؛ از تصویر، TXT، DOCX یا PDF استفاده کنید.',
+            'conversation_id.exists' => 'این مکالمه دیگر موجود نیست. لطفاً یک چت جدید باز کنید.',
         ]);
 
         $modelKey = $request->model;
@@ -101,7 +153,7 @@ class ChatController extends BaseController
                     . '<span style="color:#000">سؤالات مجاز اشتراک شما تمام شده</span><br>'
                     . '<span style="color:#000">وب سایت دکتر حکیمی صدر</span>';
             }
-            return response()->json(['error' => $error], 403);
+            return response()->json(['code' => 'quota_exceeded', 'error' => $error], 403);
         }
 
         $preparedFileTexts = [];
@@ -110,6 +162,12 @@ class ChatController extends BaseController
         foreach ((array) $request->file('files', []) as $index => $file) {
             $extension = strtolower($file->getClientOriginalExtension());
             $pageCount = null;
+            if (str_starts_with((string) $file->getMimeType(), 'image/')) {
+                $dimensions = @getimagesize($file->getRealPath());
+                if (!$dimensions || $dimensions[0] * $dimensions[1] > 16000000) {
+                    return response()->json(['error' => 'ابعاد تصویر زیاد یا فایل نامعتبر است؛ تصویری با حداکثر ۱۶ مگاپیکسل ارسال کنید.'], 422);
+                }
+            }
 
             if (!in_array($extension, ['txt', 'doc', 'docx', 'pdf'], true)) {
                 continue;
@@ -143,6 +201,9 @@ class ChatController extends BaseController
                 }
             }
 
+            if (in_array($extension, ['txt', 'doc', 'docx'], true) && trim((string) $extractedText) === '') {
+                return response()->json(['error' => 'متن فایل قابل خواندن نیست. لطفاً فایل سالم یا نسخه PDF آن را ارسال کنید.'], 422);
+            }
             $preparedFileTexts[$index] = $extractedText;
         }
 
@@ -157,15 +218,28 @@ class ChatController extends BaseController
             ]);
         }
 
-        $userMessage = Message::create([
-            'conversation_id' => $conversation->id,
-            'user_id'         => $user->id,
-            'role'            => 'user',
-            'content'         => $messageText,
-            'model'           => $modelKey,
-        ]);
-
         $uploadedFileModels = [];
+        if ($request->filled('retry_message_id')) {
+            $userMessage = $conversation->messages()
+                ->where('id', $request->integer('retry_message_id'))
+                ->where('user_id', $user->id)
+                ->where('role', 'user')
+                ->first();
+            if (!$userMessage || (int) $conversation->messages()->max('id') !== (int) $userMessage->id
+                || $userMessage->content !== $messageText || $request->hasFile('files')) {
+                return response()->json(['code' => 'retry_not_available', 'error' => 'وضعیت این پیام تغییر کرده است. مکالمه را دوباره باز کنید و پاسخ ثبت‌شده را بررسی کنید.'], 409);
+            }
+            $uploadedFileModels = $userMessage->files()->get()->all();
+        } else {
+            $userMessage = Message::create([
+                'conversation_id' => $conversation->id,
+                'user_id' => $user->id,
+                'role' => 'user',
+                'content' => $messageText,
+                'model' => $modelKey,
+            ]);
+        }
+
         if ($request->hasFile('files')) {
             foreach ($request->file('files') as $index => $file) {
                 $extension = strtolower($file->getClientOriginalExtension());
@@ -208,103 +282,117 @@ class ChatController extends BaseController
 
         $systemPrompt = (string) $this->systemPromptService->getSystemPrompt();
 
-        $previousChatMessages = $conversation->messages()
+        $historyPage = $conversation->messages()
             ->where('id', '<', $userMessage->id)
-            ->orderBy('created_at', 'asc')
-            ->get()
+            ->orderByDesc('id')
+            ->limit(81)
+            ->get(['id', 'role', 'content']);
+        $historyWasLimited = $historyPage->count() > 80;
+        $previousChatMessages = $historyPage->take(80)->reverse()
             ->map(fn($msg) => ['role' => $msg->role, 'content' => $msg->content])
-            ->toArray();
+            ->values()->all();
+
+        $titleSource = $messageText !== '' ? $messageText : ($uploadedFileModels[0]->original_name ?? 'تحلیل فایل');
+        if ($conversation->title === 'مکالمه جدید') {
+            $conversation->update(['title' => mb_strimwidth($titleSource, 0, 60, '...', 'UTF-8')]);
+        }
 
         $subscription = $user->activeSubscription;
         $isFreeQuestion = !$subscription && $user->canUseFreeQuestion();
 
+        $protocolV2 = $request->header('X-Chat-Protocol') === '2';
+        $requestId = $request->attributes->get('chat_request_id');
+
         return response()->stream(function () use (
-            $conversation,
-            $messageText,
-            $aiFileModels,
-            $uploadedFileModels,
-            $systemPrompt,
-            $previousChatMessages,
-            $subscription,
-            $isFreeQuestion,
-            $user,
-            $modelKey
+            $conversation, $messageText, $aiFileModels, $systemPrompt, $previousChatMessages,
+            $subscription, $isFreeQuestion, $user, $modelKey, $userMessage,
+            $protocolV2, $requestId, $historyWasLimited
         ) {
-            if (ob_get_level()) ob_end_clean();
+            if (ob_get_level()) {
+                ob_end_clean();
+            }
             @ini_set('zlib.output_compression', '0');
-            @ini_set('implicit_flush', '1');
-
+            @set_time_limit(210);
+            $emit = static function (string $event, array $data) use ($protocolV2): void {
+                if ($protocolV2) {
+                    echo "event: {$event}\ndata: " . json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE) . "\n\n";
+                } elseif ($event === 'delta') {
+                    echo $data['text'];
+                } elseif ($event === 'error') {
+                    echo "\n\n" . $data['message'];
+                }
+                flush();
+            };
+            $emit('meta', [
+                'conversation_id' => (string) $conversation->id,
+                'user_message_id' => $userMessage->id,
+                'title' => $conversation->title,
+                'request_id' => $requestId,
+            ]);
+            if ($historyWasLimited) {
+                $emit('notice', ['code' => 'context_trimmed']);
+            }
+            $usedModelKey = $modelKey;
             $assistantAnswer = '';
-            $isSuccess = true;
-
-            // 📌 مهم: callback اکنون فقط یک پارامتر می‌گیرد
             try {
                 $this->aiApiService->stream(
-                    $messageText,
-                    $modelKey,
-                    $systemPrompt,
-                    $previousChatMessages,
-                    $aiFileModels,
-                    function (string $chunk) use (&$assistantAnswer) {
+                    $messageText, $modelKey, $systemPrompt, $previousChatMessages, $aiFileModels,
+                    static function (string $chunk) use (&$assistantAnswer, $emit): void {
                         $assistantAnswer .= $chunk;
-                        echo $chunk;
-                        flush();
-                    }
+                        $emit('delta', ['text' => $chunk]);
+                    },
+                    static function (string $code, array $details = []) use ($emit, &$usedModelKey, $modelKey): void {
+                        if ($code === 'model_selected') {
+                            $usedModelKey = (string) ($details['key'] ?? $modelKey);
+                            if ($usedModelKey !== $modelKey) {
+                                $emit('notice', ['code' => 'model_fallback', 'name' => $details['name'] ?: $usedModelKey]);
+                            }
+                            return;
+                        }
+                        $emit('notice', ['code' => $code]);
+                    },
                 );
-            } catch (\Throwable $streamEx) {
-                \Illuminate\Support\Facades\Log::error('Stream exception', [
-                    'error' => $streamEx->getMessage(),
-                    'model' => $modelKey,
-                ]);
-            }
+                if (trim($assistantAnswer) === '') {
+                    throw new \RuntimeException('empty_ai_response');
+                }
 
-            if (trim($assistantAnswer) === '') {
-                $isSuccess = false;
-                $errorMsg = "در حال حاضر پاسخ‌دهی با اختلال موقت روبه‌رو شد. لطفاً چند لحظه بعد دوباره تلاش کنید یا یک مدل دیگر را انتخاب کنید.";
-                echo $errorMsg;
-                $assistantAnswer .= $errorMsg;
-                flush();
-            }
-
-            if ($isSuccess) {
-                Message::create([
-                    'conversation_id' => $conversation->id,
-                    'user_id'         => auth()->id(),
-                    'role'            => 'assistant',
-                    'content'         => $assistantAnswer,
-                    'model'           => $modelKey,
-                ]);
-
-                $titleSource = trim($messageText) !== ''
-                    ? trim($messageText)
-                    : ($uploadedFileModels[0]->original_name ?? 'تحلیل فایل');
-
-                if ($conversation->title === 'مکالمه جدید' && $titleSource !== '') {
-                    $conversation->update([
-                        'title' => mb_strimwidth($titleSource, 0, 60, '...', 'UTF-8')
+                // A response is complete only after persistence and quota accounting succeed.
+                $answer = DB::transaction(function () use (
+                    $conversation, $user, $usedModelKey, $assistantAnswer, $subscription, $isFreeQuestion
+                ) {
+                    $answer = Message::create([
+                        'conversation_id' => $conversation->id,
+                        'user_id' => $user->id,
+                        'role' => 'assistant',
+                        'content' => $assistantAnswer,
+                        'model' => $usedModelKey,
                     ]);
-                }
-
-                $conversation->touch();
-
-                if ($subscription) {
-                    $subscription->incrementQuestionsUsed();
-                } elseif ($isFreeQuestion) {
-                    $user->useFreeQuestion();
-                }
-            } else {
-                $systemMsg = "\n\nاعتباری از حساب شما کسر نشد.";
-                echo $systemMsg;
-                flush();
+                    $conversation->touch();
+                    if ($subscription) {
+                        $subscription->incrementQuestionsUsed();
+                    } elseif ($isFreeQuestion) {
+                        $user->useFreeQuestion();
+                    }
+                    return $answer;
+                });
+                $emit('done', ['message_id' => $answer->id, 'conversation_id' => (string) $conversation->id]);
+            } catch (\Throwable $error) {
+                ChatReliability::report($error, [
+                    'request_id' => $requestId, 'model' => $modelKey,
+                    'stage' => 'chat_stream', 'partial' => $assistantAnswer !== '',
+                ]);
+                $emit('error', array_merge(ChatReliability::publicError($error, $assistantAnswer !== ''), [
+                    'request_id' => $requestId,
+                    'retry_message_id' => $userMessage->id,
+                ]));
             }
-
         }, 200, [
-            'Content-Type'      => 'text/event-stream; charset=utf-8',
-            'Cache-Control'     => 'no-cache, must-revalidate',
-            'Connection'        => 'keep-alive',
+            'Content-Type' => 'text/event-stream; charset=utf-8',
+            'Cache-Control' => 'no-cache, no-store, must-revalidate',
             'X-Accel-Buffering' => 'no',
             'X-Conversation-Id' => (string) $conversation->id,
-            'Access-Control-Expose-Headers' => 'X-Conversation-Id',
+            'X-Chat-Protocol' => $protocolV2 ? '2' : '1',
+            'X-Request-Id' => $requestId,
         ]);
     }
 

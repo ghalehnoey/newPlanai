@@ -309,7 +309,11 @@ class AdminController extends Controller
 
     public function aiModelsIndex()
     {
-        $models = AiModel::with('proxyServer')->orderBy('sort_order')->get();
+        $models = AiModel::with('proxyServer')
+            ->orderByDesc('is_active')
+            ->orderBy('name')
+            ->orderBy('sort_order')
+            ->get();
         return view('admin.ai_models.index', compact('models'));
     }
 
@@ -621,7 +625,11 @@ class AdminController extends Controller
 
     public function aiTest()
     {
-        $models = AiModel::with('proxyServer')->orderBy('sort_order')->get();
+        $models = AiModel::with('proxyServer')
+            ->orderByDesc('is_active')
+            ->orderBy('name')
+            ->orderBy('sort_order')
+            ->get();
         $proxyServers = AiProxyServer::where('is_active', true)->orderBy('priority')->orderBy('name')->get();
         return view('admin.ai_test', compact('models', 'proxyServers'));
     }

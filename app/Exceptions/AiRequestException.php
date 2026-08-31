@@ -12,6 +12,7 @@ class AiRequestException extends RuntimeException
         public readonly int $curlErrno = 0,
         public readonly int $elapsedMs = 0,
         public readonly string $primaryIp = '',
+        public readonly ?int $retryAfterSeconds = null,
     ) {
         parent::__construct($message);
     }
