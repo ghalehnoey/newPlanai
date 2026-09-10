@@ -14,12 +14,14 @@ class Subscription extends Model
         'questions_used',
         'expires_at',
         'zibal_track_id',
-        'paid'
+        'paid',
+        'paid_amount_toman'
     ];
 
     protected $casts = [
         'expires_at' => 'datetime',
         'paid'       => 'boolean',
+        'paid_amount_toman' => 'integer',
     ];
 
     /* --------------------------------------------------------

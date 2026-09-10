@@ -10,6 +10,8 @@ use Throwable;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use App\Models\AiModel;
+use App\Models\AiFailureLog;
+use App\Models\AiUsageLog;
 
 class AiApiService
 {
@@ -575,6 +577,10 @@ class AiApiService
         bool $preferDirectAnswer = false
     ): array
     {
+        $configuredMaxTokens = (int) ($model->max_output_tokens ?? 0);
+        if ($configuredMaxTokens > 0) {
+            $maxTokens = min($maxTokens, $configuredMaxTokens);
+        }
         $body[$this->completionTokenField($model)] = $maxTokens;
 
         if ($this->isDeepSeekV4($model)) {
@@ -635,8 +641,11 @@ class AiApiService
         array $route,
         ?callable $onChunk,
         int $timeoutSeconds = 120,
-    ): int {
+    ): array {
         $body['stream'] = true;
+        if ($this->supportsStreamUsage($url)) {
+            $body['stream_options'] = ['include_usage' => true];
+        }
         $payload = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
         if (!is_string($payload)) {
@@ -649,7 +658,9 @@ class AiApiService
         $finished = false;
         $streamError = null;
         $retryAfter = null;
-        $processLine = static function (string $line) use (&$receivedContent, &$finished, &$streamError, $onChunk): void {
+        $usage = null;
+        $outputText = '';
+        $processLine = static function (string $line) use (&$receivedContent, &$finished, &$streamError, &$usage, &$outputText, $onChunk): void {
             $line = trim($line);
 
             if ($line === 'data: [DONE]') {
@@ -661,6 +672,9 @@ class AiApiService
             }
 
             $data = json_decode(substr($line, 6), true);
+            if (isset($data['usage']) && is_array($data['usage'])) {
+                $usage = $data['usage'];
+            }
             if (isset($data['error'])) {
                 $streamError = 'upstream_stream_error';
             }
@@ -671,6 +685,7 @@ class AiApiService
 
             if (is_string($chunk) && $chunk !== '') {
                 $receivedContent = true;
+                $outputText .= $chunk;
 
                 if ($onChunk) {
                     $onChunk($chunk);
@@ -775,9 +790,76 @@ class AiApiService
             if ($onChunk) {
                 $onChunk($content);
             }
+            $outputText = $content;
+            if (isset($decoded['usage']) && is_array($decoded['usage'])) {
+                $usage = $decoded['usage'];
+            }
         }
 
-        return $elapsedMs;
+        return [
+            'elapsed_ms' => $elapsedMs,
+            'usage' => $this->normalizeUsage($usage, $body, $outputText),
+        ];
+    }
+
+    private function supportsStreamUsage(string $url): bool
+    {
+        $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+
+        return $host === 'api.openai.com'
+            || $host === 'api.deepseek.com'
+            || $host === 'api.x.ai';
+    }
+
+    /** @return array{input_tokens:int,cached_input_tokens:int,output_tokens:int,reasoning_tokens:int,total_tokens:int,source:string} */
+    private function normalizeUsage(?array $usage, array $body, string $outputText): array
+    {
+        if (is_array($usage)) {
+            $input = (int) ($usage['prompt_tokens'] ?? $usage['input_tokens'] ?? 0);
+            $output = (int) ($usage['completion_tokens'] ?? $usage['output_tokens'] ?? 0);
+            $cached = (int) ($usage['prompt_tokens_details']['cached_tokens']
+                ?? $usage['input_tokens_details']['cached_tokens']
+                ?? $usage['prompt_cache_hit_tokens']
+                ?? 0);
+            $reasoning = (int) ($usage['completion_tokens_details']['reasoning_tokens']
+                ?? $usage['output_tokens_details']['reasoning_tokens']
+                ?? 0);
+            $total = (int) ($usage['total_tokens'] ?? ($input + $output));
+
+            if ($input > 0 || $output > 0 || $total > 0) {
+                return [
+                    'input_tokens' => max(0, $input),
+                    'cached_input_tokens' => max(0, min($cached, $input)),
+                    'output_tokens' => max(0, $output),
+                    'reasoning_tokens' => max(0, $reasoning),
+                    'total_tokens' => max(0, $total),
+                    'source' => 'provider',
+                ];
+            }
+        }
+
+        $messagesJson = json_encode($body['messages'] ?? [], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $input = $this->estimateTokens(is_string($messagesJson) ? $messagesJson : '');
+        $output = $this->estimateTokens($outputText);
+
+        return [
+            'input_tokens' => $input,
+            'cached_input_tokens' => 0,
+            'output_tokens' => $output,
+            'reasoning_tokens' => 0,
+            'total_tokens' => $input + $output,
+            'source' => 'estimated',
+        ];
+    }
+
+    private function estimateTokens(string $text): int
+    {
+        if ($text === '') {
+            return 0;
+        }
+
+        // Conservative cross-language estimate; provider-reported usage always takes precedence.
+        return max(1, (int) ceil(strlen($text) / 3.2));
     }
 
     /** @return array<string, mixed> */
@@ -864,6 +946,22 @@ class AiApiService
             $primary = $this->getModelConfig($primaryModelKey);
             $chain[] = $primary;
             $seen[] = $primary->key;
+
+            // Explicit admin-selected chain takes precedence over global sort order.
+            $cursor = $primary;
+            while ($cursor->fallback_model_id) {
+                $fallback = AiModel::whereKey($cursor->fallback_model_id)
+                    ->where('is_active', true)
+                    ->first();
+                if (!$fallback || in_array($fallback->key, $seen, true)) {
+                    break;
+                }
+                if (!$needsFiles || $fallback->supports_files) {
+                    $chain[] = $fallback;
+                    $seen[] = $fallback->key;
+                }
+                $cursor = $fallback;
+            }
         } catch (RuntimeException $e) {
             Log::warning('Primary model unavailable', [
                 'model' => $primaryModelKey,
@@ -1158,6 +1256,8 @@ class AiApiService
         array $uploadedFiles = [],
         callable $onChunk = null,
         ?callable $onStatus = null,
+        ?callable $onUsage = null,
+        ?string $requestId = null,
     ): void {
         $history = $this->normalizeHistory($previousChatMessages);
         $needsFiles = !empty($uploadedFiles);
@@ -1174,6 +1274,8 @@ class AiApiService
             $chain,
             $onChunk,
             $onStatus,
+            $onUsage,
+            $requestId,
         );
 
         return;
@@ -1457,6 +1559,8 @@ class AiApiService
         array $chain,
         ?callable $onChunk,
         ?callable $onStatus = null,
+        ?callable $onUsage = null,
+        ?string $requestId = null,
     ): void {
         $needsFiles = $uploadedFiles !== [];
         $hasStarted = false;
@@ -1468,6 +1572,8 @@ class AiApiService
             if (connection_aborted() || microtime(true) >= $deadline) {
                 break;
             }
+            $modelError = null;
+            $lastRouteType = null;
             try {
                 $provider = $this->getProviderConfigByModel($modelConfig);
                 if (!$provider['api_key']) {
@@ -1495,14 +1601,36 @@ class AiApiService
                     4000,
                     $this->shouldPreferDirectLegalAnswer($modelConfig, $question, $systemPrompt),
                 );
+                $budget = $this->budgetDecision($modelConfig, $prepared['messages'], $body);
+                if (!$budget['allowed']) {
+                    $lastError = new RuntimeException($budget['category']);
+                    $this->recordFailure(
+                        $requestId,
+                        $modelConfig->key,
+                        $budget['category'],
+                        $budget['message'],
+                        null,
+                        null,
+                        null,
+                        'budget',
+                    );
+                    if ($onStatus) {
+                        $onStatus('model_budget_fallback', [
+                            'key' => $modelConfig->key,
+                            'reason' => $budget['category'],
+                        ]);
+                    }
+                    continue;
+                }
                 foreach ($this->proxyRouter->routesFor($modelConfig) as $route) {
+                    $lastRouteType = $route['type'];
                     for ($attempt = 0; $attempt < 2; $attempt++) {
                         $remaining = (int) floor($deadline - microtime(true));
                         if ($remaining <= 0 || connection_aborted()) {
                             break 3;
                         }
                         try {
-                            $elapsedMs = $this->requestStream(
+                            $result = $this->requestStream(
                                 $modelConfig,
                                 $provider['base_url'],
                                 $provider['api_key'],
@@ -1514,16 +1642,42 @@ class AiApiService
                                         $onChunk($chunk);
                                     }
                                 },
-                                min(60, $remaining),
+                                min(120, $remaining),
                             );
                             if ($route['type'] === 'direct') {
                                 $this->proxyRouter->markDirectSuccess($modelConfig);
                             } else {
-                                $this->proxyRouter->markProxyResult($route['proxy'], true, $elapsedMs);
+                                $this->proxyRouter->markProxyResult($route['proxy'], true, $result['elapsed_ms']);
+                            }
+                            if ($onUsage) {
+                                $onUsage([
+                                    'used_model' => $modelConfig->key,
+                                    'provider' => $modelConfig->provider,
+                                    'model_mapping' => $this->resolveModel($modelConfig),
+                                    'route' => $route['type'],
+                                    'elapsed_ms' => $result['elapsed_ms'],
+                                    'usage' => $result['usage'],
+                                    'input_price_per_million' => (float) $modelConfig->input_price_per_million,
+                                    'cached_input_price_per_million' => (float) $modelConfig->cached_input_price_per_million,
+                                    'output_price_per_million' => (float) $modelConfig->output_price_per_million,
+                                ]);
                             }
                             return;
                         } catch (Throwable $error) {
+                            $modelError = $error;
                             $lastError = $error;
+                            $potentiallyBillable = $this->isPotentiallyBillableFailure($error);
+                            if ($potentiallyBillable) {
+                                $this->recordEstimatedFailedUsage(
+                                    $requestId,
+                                    $requestedModel,
+                                    $modelConfig,
+                                    $prepared['messages'],
+                                    $body,
+                                    $route['type'],
+                                    $error,
+                                );
+                            }
                             ChatReliability::report($error, ['model' => $modelConfig->key, 'stage' => 'upstream', 'partial' => $hasStarted]);
                             if ($hasStarted || connection_aborted()) {
                                 throw $error;
@@ -1531,7 +1685,7 @@ class AiApiService
                             $delay = $error instanceof AiRequestException
                                 ? ($error->retryAfterSeconds ?? 1)
                                 : 1;
-                            if ($attempt === 0 && ChatReliability::canRetry($error)
+                            if ($attempt === 0 && !$potentiallyBillable && ChatReliability::canRetry($error)
                                 && $delay <= 5 && microtime(true) + $delay + 2 < $deadline) {
                                 if ($onStatus) {
                                     $onStatus('retrying');
@@ -1546,8 +1700,12 @@ class AiApiService
                         }
                     }
                 }
+                if ($modelError) {
+                    $this->recordThrowable($modelError, $requestId, $modelConfig->key, $lastRouteType, 'upstream');
+                }
             } catch (Throwable $error) {
                 $lastError = $error;
+                $this->recordThrowable($error, $requestId, $modelConfig->key, $lastRouteType, 'fallback');
                 if ($hasStarted || $error instanceof \LengthException || connection_aborted()) {
                     throw $error;
                 }
@@ -1555,6 +1713,173 @@ class AiApiService
             }
         }
         throw $lastError;
+    }
+
+    private function isPotentiallyBillableFailure(Throwable $error): bool
+    {
+        return $error instanceof AiRequestException
+            && ($error->httpCode === 200 || in_array($error->curlErrno, [CURLE_OPERATION_TIMEDOUT, CURLE_PARTIAL_FILE], true));
+    }
+
+    private function recordEstimatedFailedUsage(
+        ?string $requestId,
+        string $requestedModel,
+        AiModel $model,
+        array $messages,
+        array $body,
+        string $route,
+        Throwable $error,
+    ): void {
+        try {
+            $inputTokens = $this->estimateMessageTokens($messages);
+            $outputTokens = max(1, (int) ($body['max_completion_tokens'] ?? $body['max_tokens'] ?? 1800));
+            $inputPrice = max(0, (float) $model->input_price_per_million);
+            $outputPrice = max(0, (float) $model->output_price_per_million);
+            $cost = ($inputTokens * $inputPrice + $outputTokens * $outputPrice) / 1000000;
+
+            AiUsageLog::create([
+                'request_id' => $requestId,
+                'requested_model' => $requestedModel,
+                'used_model' => $model->key,
+                'provider' => $model->provider,
+                'model_mapping' => $this->resolveModel($model),
+                'route' => $route,
+                'input_tokens' => $inputTokens,
+                'cached_input_tokens' => 0,
+                'output_tokens' => $outputTokens,
+                'reasoning_tokens' => 0,
+                'total_tokens' => $inputTokens + $outputTokens,
+                'input_price_per_million' => $inputPrice,
+                'cached_input_price_per_million' => max(0, (float) $model->cached_input_price_per_million),
+                'output_price_per_million' => $outputPrice,
+                'estimated_cost_usd' => round($cost, 8),
+                'usage_source' => 'estimated',
+                'elapsed_ms' => $error instanceof AiRequestException ? max(0, $error->elapsedMs) : 0,
+            ]);
+        } catch (Throwable $loggingError) {
+            Log::warning('Unable to record estimated failed AI usage', [
+                'model' => $model->key,
+                'error' => $loggingError->getMessage(),
+            ]);
+        }
+    }
+
+    /** @return array{allowed:bool,category:string,message:string} */
+    private function budgetDecision(AiModel $model, array $messages, array $body): array
+    {
+        $costLimit = (float) ($model->daily_cost_limit_usd ?? 0);
+        $tokenLimit = (int) ($model->daily_token_limit ?? 0);
+        if ($costLimit <= 0 && $tokenLimit <= 0) {
+            return ['allowed' => true, 'category' => '', 'message' => ''];
+        }
+
+        $spent = AiUsageLog::query()
+            ->where('used_model', $model->key)
+            ->where('created_at', '>=', now('Asia/Tehran')->startOfDay()->utc())
+            ->selectRaw('COALESCE(SUM(total_tokens), 0) as tokens, COALESCE(SUM(estimated_cost_usd), 0) as cost')
+            ->first();
+        $inputReserve = $this->estimateMessageTokens($messages);
+        $outputReserve = max(1, (int) ($body['max_completion_tokens'] ?? $body['max_tokens'] ?? 4000));
+        $reservedTokens = $inputReserve + $outputReserve;
+        $inputPrice = max(0, (float) $model->input_price_per_million);
+        $outputPrice = max(0, (float) $model->output_price_per_million);
+
+        if ($costLimit > 0 && $inputPrice <= 0 && $outputPrice <= 0) {
+            return [
+                'allowed' => false,
+                'category' => 'budget_pricing_missing',
+                'message' => 'سقف دلاری فعال است اما تعرفه توکن مدل تنظیم نشده است.',
+            ];
+        }
+
+        $reservedCost = ($inputReserve * $inputPrice + $outputReserve * $outputPrice) / 1000000;
+        if ($costLimit > 0 && ((float) $spent->cost + $reservedCost) > $costLimit) {
+            return [
+                'allowed' => false,
+                'category' => 'daily_cost_limit',
+                'message' => sprintf('سقف روزانه مدل %.4f دلار است؛ مصرف ثبت‌شده %.4f دلار.', $costLimit, (float) $spent->cost),
+            ];
+        }
+        if ($tokenLimit > 0 && ((int) $spent->tokens + $reservedTokens) > $tokenLimit) {
+            return [
+                'allowed' => false,
+                'category' => 'daily_token_limit',
+                'message' => sprintf('سقف روزانه مدل %d توکن است؛ مصرف ثبت‌شده %d توکن.', $tokenLimit, (int) $spent->tokens),
+            ];
+        }
+
+        return ['allowed' => true, 'category' => '', 'message' => ''];
+    }
+
+    private function estimateMessageTokens(array $messages): int
+    {
+        $tokens = 0;
+        foreach ($messages as $message) {
+            $content = $message['content'] ?? '';
+            if (is_string($content)) {
+                $tokens += $this->estimateTokens($content) + 6;
+                continue;
+            }
+            foreach ((array) $content as $part) {
+                $tokens += ($part['type'] ?? '') === 'image_url'
+                    ? 2000
+                    : $this->estimateTokens((string) ($part['text'] ?? ''));
+            }
+            $tokens += 6;
+        }
+
+        return max(1, $tokens);
+    }
+
+    private function recordThrowable(
+        Throwable $error,
+        ?string $requestId,
+        ?string $modelKey,
+        ?string $route,
+        string $stage,
+    ): void {
+        $http = $error instanceof AiRequestException ? $error->httpCode : null;
+        $curl = $error instanceof AiRequestException ? $error->curlErrno : null;
+        $message = $this->proxyRouter->sanitizeError($error->getMessage());
+        $category = match (true) {
+            preg_match('/quota|billing|credit|balance|insufficient|spend/i', $message) === 1 || $http === 402 => 'provider_credit',
+            $http === 401 => 'authentication',
+            in_array($http, [403, 451], true) => 'access_blocked',
+            $http === 429 => 'rate_limit',
+            $http === 408 || $curl === 28 => 'timeout',
+            in_array($curl, [6, 7, 35, 52, 55, 56, 92], true) => 'network',
+            $http !== null && $http >= 500 => 'provider_error',
+            in_array($http, [400, 404, 422], true) => 'invalid_request',
+            default => 'unknown',
+        };
+
+        $this->recordFailure($requestId, $modelKey, $category, $message, $http, $curl, $route, $stage);
+    }
+
+    private function recordFailure(
+        ?string $requestId,
+        ?string $modelKey,
+        string $category,
+        string $message,
+        ?int $http,
+        ?int $curl,
+        ?string $route,
+        string $stage,
+    ): void {
+        try {
+            AiFailureLog::create([
+                'request_id' => $requestId,
+                'model_key' => $modelKey,
+                'category' => $category,
+                'message' => mb_strimwidth($message, 0, 500, '...', 'UTF-8'),
+                'http_status' => $http ?: null,
+                'curl_errno' => $curl ?: null,
+                'route' => $route,
+                'stage' => $stage,
+            ]);
+        } catch (Throwable $loggingError) {
+            Log::warning('AI failure database logging failed', ['exception' => get_class($loggingError)]);
+        }
     }
 
     private function normalizeHistory(array $messages): array

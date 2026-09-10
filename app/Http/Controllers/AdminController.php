@@ -8,16 +8,20 @@ use App\Models\Plan;
 use App\Models\Subscription;
 use App\Models\AiModel;
 use App\Models\AiProxyServer;
+use App\Models\AiUsageLog;
+use App\Models\AiFailureLog;
 use App\Models\Conversation;
 use App\Models\Message;
 use App\Services\SystemPromptService;
 use App\Services\AiApiService;
 use App\Services\AiProxyRouter;
 use App\Services\RemoteProxyProvisioner;
+use App\Services\ConversationMemoryService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Cache;
 use Carbon\Carbon;
+use Morilog\Jalali\Jalalian;
 
 class AdminController extends Controller
 {
@@ -70,8 +74,70 @@ class AdminController extends Controller
         });
 
         $plans = Cache::remember('admin:dashboard:plans', 300, static fn () => Plan::orderBy('price')->get());
+        $aiFailureSummary = Cache::remember('admin:ai-failure-summary', 60, static function (): array {
+            $since = now()->subDay();
+            return [
+                'count' => AiFailureLog::where('created_at', '>=', $since)->count(),
+                'categories' => AiFailureLog::where('created_at', '>=', $since)
+                    ->selectRaw('category, COUNT(*) as total')
+                    ->groupBy('category')->orderByDesc('total')->limit(4)->get(),
+            ];
+        });
+        $financialMonth = null;
+        if (auth()->user()->role === 'manager') {
+            $financialMonth = Cache::remember('admin:financial-current-jalali', 300, static function (): array {
+                $jalaliNow = Jalalian::fromCarbon(now('Asia/Tehran'));
+                $jalaliStart = new Jalalian($jalaliNow->getYear(), $jalaliNow->getMonth(), 1);
+                $jalaliNext = $jalaliStart->addMonths(1);
+                $startUtc = Carbon::createFromFormat(
+                    'Y-m-d H:i:s',
+                    $jalaliStart->toCarbon()->format('Y-m-d') . ' 00:00:00',
+                    'Asia/Tehran'
+                )->utc();
+                $endUtc = Carbon::createFromFormat(
+                    'Y-m-d H:i:s',
+                    $jalaliNext->toCarbon()->format('Y-m-d') . ' 00:00:00',
+                    'Asia/Tehran'
+                )->utc();
 
-        return view('admin.dashboard', compact('users', 'stats', 'plans', 'search', 'status', 'role'));
+                $sales = DB::table('subscriptions as s')
+                    ->leftJoin('plans as p', 'p.id', '=', 's.plan_id')
+                    ->where('s.paid', true)
+                    ->whereNotNull('s.zibal_track_id')
+                    ->where('s.created_at', '>=', $startUtc)
+                    ->where('s.created_at', '<', $endUtc)
+                    ->selectRaw('COUNT(*) as total_count, COALESCE(SUM(COALESCE(s.paid_amount_toman, p.price)), 0) as total_toman')
+                    ->first();
+                $ai = AiUsageLog::where('created_at', '>=', $startUtc)
+                    ->where('created_at', '<', $endUtc)
+                    ->selectRaw('COALESCE(SUM(estimated_cost_usd), 0) as cost_usd, COALESCE(SUM(total_tokens), 0) as tokens')
+                    ->first();
+                $usdRate = max(0, (float) (DB::table('settings')->where('key', 'usd_to_toman_rate')->value('value') ?? 0));
+                $aiCostUsd = (float) ($ai->cost_usd ?? 0);
+                $aiCostToman = $usdRate > 0 ? $aiCostUsd * $usdRate : null;
+                $salesToman = (int) ($sales->total_toman ?? 0);
+                $trackingStartedAt = AiUsageLog::min('created_at');
+                $trackingStartedJalali = $trackingStartedAt
+                    ? Jalalian::fromCarbon(Carbon::parse($trackingStartedAt)->setTimezone('Asia/Tehran'))->format('Y/m/d H:i')
+                    : null;
+
+                return [
+                    'label' => $jalaliStart->format('F Y'),
+                    'sales_count' => (int) ($sales->total_count ?? 0),
+                    'sales_toman' => $salesToman,
+                    'ai_cost_usd' => $aiCostUsd,
+                    'ai_cost_toman' => $aiCostToman,
+                    'net_toman' => $aiCostToman !== null ? $salesToman - $aiCostToman : null,
+                    'tokens' => (int) ($ai->tokens ?? 0),
+                    'usd_rate' => $usdRate,
+                    'ai_tracking_from' => $trackingStartedJalali,
+                    'from' => $jalaliStart->format('Y/m/d'),
+                    'to' => $jalaliNext->format('Y/m/d'),
+                ];
+            });
+        }
+
+        return view('admin.dashboard', compact('users', 'stats', 'plans', 'search', 'status', 'role', 'aiFailureSummary', 'financialMonth'));
     }
 
     public function topUsers()
@@ -309,18 +375,22 @@ class AdminController extends Controller
 
     public function aiModelsIndex()
     {
-        $models = AiModel::with('proxyServer')
+        $models = AiModel::with(['proxyServer', 'fallbackModel'])
             ->orderByDesc('is_active')
             ->orderBy('name')
             ->orderBy('sort_order')
             ->get();
-        return view('admin.ai_models.index', compact('models'));
+        $usageToday = AiUsageLog::where('created_at', '>=', now('Asia/Tehran')->startOfDay()->utc())
+            ->selectRaw('used_model, SUM(total_tokens) as tokens, SUM(estimated_cost_usd) as cost')
+            ->groupBy('used_model')->get()->keyBy('used_model');
+        return view('admin.ai_models.index', compact('models', 'usageToday'));
     }
 
     public function aiModelsCreate()
     {
         $proxyServers = AiProxyServer::orderBy('priority')->orderBy('name')->get();
-        return view('admin.ai_models.create', compact('proxyServers'));
+        $fallbackModels = AiModel::orderByDesc('is_active')->orderBy('sort_order')->orderBy('name')->get();
+        return view('admin.ai_models.create', compact('proxyServers', 'fallbackModels'));
     }
 
     public function aiModelsStore(Request $request)
@@ -340,7 +410,14 @@ class AdminController extends Controller
             'proxy_mode'      => 'required|in:direct,auto,proxy',
             'proxy_server_id' => 'nullable|exists:ai_proxy_servers,id',
             'timeout_seconds' => 'nullable|integer|min:10|max:300',
+            'max_output_tokens' => 'nullable|integer|min:100|max:100000',
             'sort_order'      => 'integer',
+            'input_price_per_million' => 'nullable|numeric|min:0|max:100000',
+            'cached_input_price_per_million' => 'nullable|numeric|min:0|max:100000',
+            'output_price_per_million' => 'nullable|numeric|min:0|max:100000',
+            'daily_cost_limit_usd' => 'nullable|numeric|min:0|max:1000000',
+            'daily_token_limit' => 'nullable|integer|min:0|max:1000000000000',
+            'fallback_model_id' => 'nullable|exists:ai_models,id',
         ]);
 
         $validated['supports_files']  = $request->has('supports_files');
@@ -348,6 +425,16 @@ class AdminController extends Controller
         $validated['use_proxy']       = $validated['proxy_mode'] === 'proxy';
         $validated['proxy_url']       = $request->input('proxy_url') ?: null;
         $validated['timeout_seconds'] = (int) $request->input('timeout_seconds', 120);
+        $validated['max_output_tokens'] = (int) $request->input('max_output_tokens', 0) ?: null;
+        $validated['input_price_per_million'] = (float) $request->input('input_price_per_million', 0);
+        $validated['cached_input_price_per_million'] = (float) $request->input('cached_input_price_per_million', 0);
+        $validated['output_price_per_million'] = (float) $request->input('output_price_per_million', 0);
+        $validated['daily_cost_limit_usd'] = (float) $request->input('daily_cost_limit_usd', 0) ?: null;
+        $validated['daily_token_limit'] = (int) $request->input('daily_token_limit', 0) ?: null;
+        $validated['fallback_model_id'] = $request->input('fallback_model_id') ?: null;
+        if ($validated['daily_cost_limit_usd'] && $validated['input_price_per_million'] <= 0 && $validated['output_price_per_million'] <= 0) {
+            return back()->withInput()->withErrors(['daily_cost_limit_usd' => 'برای سقف دلاری ابتدا تعرفه ورودی یا خروجی مدل را وارد کنید.']);
+        }
 
         AiModel::create($validated);
         return redirect()->route('admin.ai-models.index')->with('success', 'مدل جدید اضافه شد.');
@@ -356,7 +443,9 @@ class AdminController extends Controller
     public function aiModelsEdit(AiModel $aiModel)
     {
         $proxyServers = AiProxyServer::orderBy('priority')->orderBy('name')->get();
-        return view('admin.ai_models.edit', compact('aiModel', 'proxyServers'));
+        $fallbackModels = AiModel::where('id', '!=', $aiModel->id)
+            ->orderByDesc('is_active')->orderBy('sort_order')->orderBy('name')->get();
+        return view('admin.ai_models.edit', compact('aiModel', 'proxyServers', 'fallbackModels'));
     }
 
     public function aiModelsUpdate(Request $request, AiModel $aiModel)
@@ -374,7 +463,14 @@ class AdminController extends Controller
             'proxy_mode'      => 'required|in:direct,auto,proxy',
             'proxy_server_id' => 'nullable|exists:ai_proxy_servers,id',
             'timeout_seconds' => 'nullable|integer|min:10|max:300',
+            'max_output_tokens' => 'nullable|integer|min:100|max:100000',
             'sort_order'      => 'integer',
+            'input_price_per_million' => 'nullable|numeric|min:0|max:100000',
+            'cached_input_price_per_million' => 'nullable|numeric|min:0|max:100000',
+            'output_price_per_million' => 'nullable|numeric|min:0|max:100000',
+            'daily_cost_limit_usd' => 'nullable|numeric|min:0|max:1000000',
+            'daily_token_limit' => 'nullable|integer|min:0|max:1000000000000',
+            'fallback_model_id' => 'nullable|exists:ai_models,id|not_in:' . $aiModel->id,
         ]);
 
         $validated['supports_files']  = $request->has('supports_files');
@@ -382,6 +478,16 @@ class AdminController extends Controller
         $validated['use_proxy']       = $validated['proxy_mode'] === 'proxy';
         $validated['proxy_url']       = $request->input('proxy_url') ?: null;
         $validated['timeout_seconds'] = (int) $request->input('timeout_seconds', 120);
+        $validated['max_output_tokens'] = (int) $request->input('max_output_tokens', 0) ?: null;
+        $validated['input_price_per_million'] = (float) $request->input('input_price_per_million', 0);
+        $validated['cached_input_price_per_million'] = (float) $request->input('cached_input_price_per_million', 0);
+        $validated['output_price_per_million'] = (float) $request->input('output_price_per_million', 0);
+        $validated['daily_cost_limit_usd'] = (float) $request->input('daily_cost_limit_usd', 0) ?: null;
+        $validated['daily_token_limit'] = (int) $request->input('daily_token_limit', 0) ?: null;
+        $validated['fallback_model_id'] = $request->input('fallback_model_id') ?: null;
+        if ($validated['daily_cost_limit_usd'] && $validated['input_price_per_million'] <= 0 && $validated['output_price_per_million'] <= 0) {
+            return back()->withInput()->withErrors(['daily_cost_limit_usd' => 'برای سقف دلاری ابتدا تعرفه ورودی یا خروجی مدل را وارد کنید.']);
+        }
 
         if (empty($validated['api_key'])) {
             unset($validated['api_key']);
@@ -600,27 +706,144 @@ class AdminController extends Controller
         return response()->stream($callback, 200, $headers);
     }
 
-    public function systemSettings()
+    public function systemSettings(ConversationMemoryService $conversationMemoryService)
     {
         $dailyFreeQuestions = (int) DB::table('settings')
             ->where('key', 'daily_free_questions')
             ->value('value') ?? 1;
+        $usdToTomanRate = (float) DB::table('settings')
+            ->where('key', 'usd_to_toman_rate')
+            ->value('value') ?? 0;
+        $memorySettings = $conversationMemoryService->settings();
+        $memoryStats = DB::table('conversation_memories')
+            ->selectRaw('COUNT(*) as conversations, COALESCE(SUM(estimated_tokens), 0) as estimated_tokens')
+            ->first();
 
-        return view('admin.system', compact('dailyFreeQuestions'));
+        return view('admin.system', compact('dailyFreeQuestions', 'usdToTomanRate', 'memorySettings', 'memoryStats'));
     }
 
-    public function systemSettingsSave(Request $request)
+    public function systemSettingsSave(Request $request, ConversationMemoryService $conversationMemoryService)
     {
         $request->validate([
-            'daily_free_questions' => 'required|integer|min:0|max:100',
+            'daily_free_questions' => 'nullable|integer|min:0|max:100',
+            'ai_history_message_limit' => 'nullable|integer|min:0|max:80',
+            'usd_to_toman_rate' => 'nullable|numeric|min:0|max:100000000',
+            'ai_memory_enabled' => 'nullable|boolean',
+            'ai_memory_recent_turns' => 'nullable|integer|min:0|max:20',
+            'ai_memory_previous_conversations' => 'nullable|integer|min:0|max:10',
+            'ai_memory_summary_max_characters' => 'nullable|integer|min:600|max:12000',
+            'ai_memory_cross_chat_max_characters' => 'nullable|integer|min:0|max:10000',
+            'ai_memory_context_token_budget' => 'nullable|integer|min:800|max:30000',
+            'ai_memory_recent_message_max_characters' => 'nullable|integer|min:500|max:12000',
+            'ai_memory_source_message_limit' => 'nullable|integer|min:20|max:500',
+            'ai_memory_reuse_files_limit' => 'nullable|integer|min:0|max:3',
+            'ai_memory_file_reuse_turns' => 'nullable|integer|min:0|max:20',
         ]);
+        if (!$request->hasAny(array_merge(
+            ['daily_free_questions', 'ai_history_message_limit', 'usd_to_toman_rate'],
+            ConversationMemoryService::SETTING_KEYS,
+        ))) {
+            return back()->withErrors(['settings' => 'هیچ تنظیمی برای ذخیره ارسال نشده است.']);
+        }
 
-        DB::table('settings')->updateOrInsert(
-            ['key' => 'daily_free_questions'],
-            ['value' => $request->daily_free_questions, 'updated_at' => now()]
-        );
+        if ($request->filled('daily_free_questions') || $request->input('daily_free_questions') === '0') {
+            DB::table('settings')->updateOrInsert(
+                ['key' => 'daily_free_questions'],
+                ['value' => $request->daily_free_questions, 'updated_at' => now()]
+            );
+            Cache::forget('daily_free_questions');
+        }
+        if ($request->filled('ai_history_message_limit') || $request->input('ai_history_message_limit') === '0') {
+            DB::table('settings')->updateOrInsert(
+                ['key' => 'ai_history_message_limit'],
+                ['value' => $request->ai_history_message_limit, 'updated_at' => now()]
+            );
+            Cache::forget('ai_history_message_limit');
+        }
+        if ($request->filled('usd_to_toman_rate') || $request->input('usd_to_toman_rate') === '0') {
+            DB::table('settings')->updateOrInsert(
+                ['key' => 'usd_to_toman_rate'],
+                ['value' => $request->usd_to_toman_rate, 'updated_at' => now()]
+            );
+            Cache::forget('admin:financial-current-jalali');
+        }
+
+        foreach (ConversationMemoryService::SETTING_KEYS as $key) {
+            if (!$request->exists($key)) {
+                continue;
+            }
+            DB::table('settings')->updateOrInsert(
+                ['key' => $key],
+                ['value' => (string) (int) $request->input($key, 0), 'updated_at' => now()],
+            );
+        }
+        $conversationMemoryService->forgetSettingsCache();
 
         return back()->with('success', 'تنظیمات ذخیره شد.');
+    }
+
+    public function resetConversationMemories()
+    {
+        $count = DB::table('conversation_memories')->delete();
+
+        return back()->with('success', number_format($count) . ' حافظه فشرده پاک شد؛ پیام‌های اصلی حذف نشدند و حافظه‌ها هنگام استفاده بعدی بازسازی می‌شوند.');
+    }
+
+    public function aiUsage(Request $request)
+    {
+        $request->validate([
+            'from' => 'nullable|date_format:Y-m-d',
+            'to' => 'nullable|date_format:Y-m-d',
+            'model' => 'nullable|string|max:100',
+        ]);
+        $to = Carbon::parse($request->input('to', now()->toDateString()))->endOfDay();
+        $from = Carbon::parse($request->input('from', $to->copy()->subDays(13)->toDateString()))->startOfDay();
+        if ($from->diffInDays($to) > 90 || $from->greaterThan($to)) {
+            $from = $to->copy()->subDays(89)->startOfDay();
+        }
+
+        $base = AiUsageLog::query()->whereBetween('created_at', [$from, $to]);
+        if ($request->filled('model')) {
+            $base->where('used_model', $request->string('model')->toString());
+        }
+
+        $summary = (clone $base)->selectRaw(
+            'COUNT(*) as requests, COALESCE(SUM(input_tokens),0) as input_tokens, COALESCE(SUM(cached_input_tokens),0) as cached_input_tokens, COALESCE(SUM(output_tokens),0) as output_tokens, COALESCE(SUM(reasoning_tokens),0) as reasoning_tokens, COALESCE(SUM(total_tokens),0) as total_tokens, COALESCE(SUM(estimated_cost_usd),0) as cost_usd'
+        )->first();
+        $byModel = (clone $base)->selectRaw(
+            'used_model, model_mapping, COUNT(*) as requests, SUM(input_tokens) as input_tokens, SUM(output_tokens) as output_tokens, SUM(total_tokens) as total_tokens, SUM(estimated_cost_usd) as cost_usd'
+        )->groupBy('used_model', 'model_mapping')->orderByDesc('cost_usd')->get();
+        $byDay = (clone $base)->selectRaw(
+            'DATE(created_at) as usage_date, COUNT(*) as requests, SUM(total_tokens) as total_tokens, SUM(estimated_cost_usd) as cost_usd'
+        )->groupByRaw('DATE(created_at)')->orderBy('usage_date')->get();
+        $logs = (clone $base)->latest()->paginate(50)->withQueryString();
+        $models = AiUsageLog::query()->select('used_model')->distinct()->orderBy('used_model')->pluck('used_model');
+
+        return view('admin.ai_usage', compact('summary', 'byModel', 'byDay', 'logs', 'models', 'from', 'to'));
+    }
+
+    public function aiErrors(Request $request)
+    {
+        $request->validate([
+            'category' => 'nullable|string|max:40',
+            'model' => 'nullable|string|max:100',
+        ]);
+        $query = AiFailureLog::query();
+        if ($request->filled('category')) {
+            $query->where('category', $request->string('category')->toString());
+        }
+        if ($request->filled('model')) {
+            $query->where('model_key', $request->string('model')->toString());
+        }
+
+        $logs = (clone $query)->latest()->paginate(50)->withQueryString();
+        $summary = AiFailureLog::where('created_at', '>=', now()->subDay())
+            ->selectRaw('category, COUNT(*) as total')
+            ->groupBy('category')->orderByDesc('total')->get();
+        $categories = AiFailureLog::select('category')->distinct()->orderBy('category')->pluck('category');
+        $models = AiFailureLog::whereNotNull('model_key')->select('model_key')->distinct()->orderBy('model_key')->pluck('model_key');
+
+        return view('admin.ai_errors', compact('logs', 'summary', 'categories', 'models'));
     }
 
     public function aiTest()

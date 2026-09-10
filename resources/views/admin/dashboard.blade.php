@@ -16,6 +16,32 @@
     </button>
 </div>
 
+@if(auth()->user()->role === 'manager' && ($aiFailureSummary['count'] ?? 0) > 0)
+@php
+    $errorLabels = ['provider_credit'=>'اعتبار یا سهمیه ارائه‌دهنده', 'authentication'=>'کلید API نامعتبر', 'access_blocked'=>'مسیر دسترسی مسدود', 'rate_limit'=>'محدودیت تعداد درخواست', 'timeout'=>'مهلت پاسخ تمام شد', 'network'=>'خطای شبکه/پراکسی', 'provider_error'=>'خطای سرویس‌دهنده', 'invalid_request'=>'درخواست نامعتبر', 'daily_cost_limit'=>'سقف دلاری روزانه', 'daily_token_limit'=>'سقف توکن روزانه', 'budget_pricing_missing'=>'تعرفه مدل ناقص', 'unknown'=>'خطای نامشخص'];
+@endphp
+<div class="mb-6 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+    <div class="flex flex-wrap items-center justify-between gap-2"><strong>{{ number_format($aiFailureSummary['count']) }} رویداد هوش مصنوعی در ۲۴ ساعت اخیر</strong><a href="{{ route('admin.ai-errors') }}" class="font-semibold text-amber-800 underline">مشاهده جزئیات</a></div>
+    <div class="mt-2 flex flex-wrap gap-2">@foreach($aiFailureSummary['categories'] as $item)<span class="rounded-full bg-white/70 px-2 py-1">{{ $errorLabels[$item->category] ?? $item->category }}: {{ $item->total }}</span>@endforeach</div>
+</div>
+@endif
+
+@if(auth()->user()->role === 'manager' && $financialMonth)
+<div class="mb-6 rounded-2xl border border-indigo-100 bg-gradient-to-l from-indigo-50 to-white p-5 shadow-sm">
+    <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
+        <div><h2 class="font-bold text-slate-800">گزارش مالی ماه {{ $financialMonth['label'] }}</h2><p class="mt-1 text-xs text-slate-500">از {{ $financialMonth['from'] }} تا پیش از {{ $financialMonth['to'] }} ـ فقط پرداخت‌های تأییدشده درگاه</p>@if($financialMonth['ai_tracking_from'])<p class="mt-1 text-xs text-amber-700">ثبت هزینه AI از {{ $financialMonth['ai_tracking_from'] }} آغاز شده است؛ هزینه قبل از این زمان در گزارش موجود نیست.</p>@endif</div>
+        <a href="{{ route('admin.ai-usage') }}" class="text-xs font-semibold text-indigo-700 hover:underline">جزئیات مصرف AI</a>
+    </div>
+    <div class="grid grid-cols-2 gap-3 lg:grid-cols-5">
+        <div class="rounded-xl bg-white p-3"><div class="text-xs text-slate-500">فروش موفق</div><div class="mt-1 text-xl font-bold text-emerald-700">{{ number_format($financialMonth['sales_toman']) }}</div><div class="text-xs text-slate-400">تومان ـ {{ number_format($financialMonth['sales_count']) }} پرداخت</div></div>
+        <div class="rounded-xl bg-white p-3"><div class="text-xs text-slate-500">هزینه هوش مصنوعی</div><div class="mt-1 text-xl font-bold text-rose-700" dir="ltr">${{ number_format($financialMonth['ai_cost_usd'], 4) }}</div><div class="text-xs text-slate-400">{{ number_format($financialMonth['tokens']) }} توکن</div></div>
+        <div class="rounded-xl bg-white p-3"><div class="text-xs text-slate-500">هزینه AI به تومان</div><div class="mt-1 text-xl font-bold text-rose-700">{{ $financialMonth['ai_cost_toman'] !== null ? number_format($financialMonth['ai_cost_toman']) : '—' }}</div><div class="text-xs text-slate-400">{{ $financialMonth['usd_rate'] > 0 ? 'نرخ دلار: '.number_format($financialMonth['usd_rate']) : 'نرخ دلار تنظیم نشده' }}</div></div>
+        <div class="rounded-xl bg-white p-3"><div class="text-xs text-slate-500">مانده تقریبی</div><div class="mt-1 text-xl font-bold {{ ($financialMonth['net_toman'] ?? 0) >= 0 ? 'text-indigo-700' : 'text-red-700' }}">{{ $financialMonth['net_toman'] !== null ? number_format($financialMonth['net_toman']) : '—' }}</div><div class="text-xs text-slate-400">فروش منهای هزینه AI</div></div>
+        <div class="rounded-xl bg-white p-3"><div class="text-xs text-slate-500">نسبت هزینه AI</div><div class="mt-1 text-xl font-bold text-slate-700">@if($financialMonth['sales_toman'] > 0 && $financialMonth['ai_cost_toman'] !== null){{ number_format(($financialMonth['ai_cost_toman'] / $financialMonth['sales_toman']) * 100, 2) }}٪@else—@endif</div><div class="text-xs text-slate-400">از فروش این ماه</div></div>
+    </div>
+</div>
+@endif
+
 {{-- Stats Cards --}}
 <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
     <div class="stat-card">

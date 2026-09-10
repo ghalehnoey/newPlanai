@@ -79,7 +79,10 @@ Route::middleware(['auth', 'manager'])->prefix('admin')->name('admin.')->group(f
     Route::get('/reports/repeat-purchasers',   [AdminController::class, 'repeatPurchasersExport'])->name('reports.repeat-purchasers');
     Route::get('/system',                     [AdminController::class, 'systemSettings'])->name('system');
     Route::post('/system/settings',           [AdminController::class, 'systemSettingsSave'])->name('system.settings.save');
+    Route::post('/system/memory/reset',        [AdminController::class, 'resetConversationMemories'])->name('system.memory.reset');
     Route::get('/ai-test',                    [AdminController::class, 'aiTest'])->name('ai-test');
+    Route::get('/ai-usage',                   [AdminController::class, 'aiUsage'])->name('ai-usage');
+    Route::get('/ai-errors',                  [AdminController::class, 'aiErrors'])->name('ai-errors');
     Route::post('/ai-test/run',               [AdminController::class, 'aiTestRun'])->name('ai-test.run');
     Route::get('/chatbot-settings',           [AdminController::class, 'chatbotSettings'])->name('chatbot-settings');
     Route::post('/chatbot-settings',          [AdminController::class, 'chatbotSettingsSave'])->name('chatbot-settings.save');

@@ -14,7 +14,7 @@
 </div>
 
 <div class="overflow-x-auto rounded-2xl border border-slate-100 bg-white shadow-sm">
-    <table class="w-full min-w-[900px] text-sm">
+    <table class="w-full min-w-[1100px] text-sm">
         <thead class="bg-slate-50 text-xs text-slate-500">
             <tr>
                 <th class="px-4 py-3 text-right font-medium">ترتیب</th>
@@ -23,6 +23,8 @@
                 <th class="px-4 py-3 text-right font-medium">ارائه‌دهنده</th>
                 <th class="px-4 py-3 text-right font-medium">فایل</th>
                 <th class="px-4 py-3 text-right font-medium">مسیر اتصال</th>
+                <th class="px-4 py-3 text-right font-medium">مصرف امروز / سقف</th>
+                <th class="px-4 py-3 text-right font-medium">مدل جایگزین</th>
                 <th class="px-4 py-3 text-right font-medium">وضعیت</th>
                 <th class="px-4 py-3 text-right font-medium">عملیات</th>
             </tr>
@@ -46,10 +48,16 @@
                     @endif
                     @if($model->proxyServer)<div class="mt-1 text-[11px] text-slate-500">{{ $model->proxyServer->name }}</div>@endif
                 </td>
+                @php($today = $usageToday->get($model->key))
+                <td class="px-4 py-3 text-xs text-slate-600">
+                    <div dir="ltr">${{ number_format((float)($today->cost ?? 0), 4) }} / {{ $model->daily_cost_limit_usd ? '$'.number_format((float)$model->daily_cost_limit_usd, 2) : '∞' }}</div>
+                    <div class="mt-1" dir="ltr">{{ number_format((int)($today->tokens ?? 0)) }} / {{ $model->daily_token_limit ? number_format($model->daily_token_limit) : '∞' }} token</div>
+                </td>
+                <td class="px-4 py-3 text-xs">@if($model->fallbackModel)<span class="font-semibold text-indigo-700">{{ $model->fallbackModel->name }}</span><div class="font-mono text-[10px] text-slate-400">{{ $model->fallbackModel->key }}</div>@else<span class="text-slate-400">خودکار بر اساس ترتیب</span>@endif</td>
                 <td class="px-4 py-3">@if($model->is_active)<span class="badge-active">فعال</span>@else<span class="badge-expired">غیرفعال</span>@endif</td>
                 <td class="px-4 py-3">
                     <div class="flex gap-1.5">
-                        <a href="{{ route('admin.ai-models.edit', $model) }}" class="rounded-lg bg-indigo-50 px-2.5 py-1.5 text-xs font-medium text-indigo-600 hover:bg-indigo-100">ویرایش</a>
+                        <a href="{{ route('admin.ai-models.edit', $model) }}" class="rounded-lg bg-indigo-50 px-2.5 py-1.5 text-xs font-medium text-indigo-600 hover:bg-indigo-100">سقف و جایگزین</a>
                         <form method="POST" action="{{ route('admin.ai-models.destroy', $model) }}" onsubmit="return confirm('مدل حذف شود؟')">@csrf @method('DELETE')<button class="rounded-lg bg-red-50 px-2.5 py-1.5 text-xs font-medium text-red-500 hover:bg-red-100">حذف</button></form>
                     </div>
                 </td>

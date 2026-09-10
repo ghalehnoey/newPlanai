@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Cache;
 use App\Models\Plan;
 use App\Models\Subscription;
 use App\Models\User;
@@ -55,9 +56,12 @@ class PaymentController extends Controller
         }
 
         $callbackUrl = route('payment.callback');
+        $paymentReferer = rtrim((string) config('app.url'), '/') . '/';
 
         try {
-            $response = Http::acceptJson()->asJson()->connectTimeout(5)->timeout(15)->post("https://gateway.zibal.ir/v1/request", [
+            $response = Http::withHeaders([
+                'Referer' => $paymentReferer,
+            ])->acceptJson()->asJson()->connectTimeout(5)->timeout(15)->post("https://gateway.zibal.ir/v1/request", [
                 "merchant"    => $this->merchant,
                 "amount"      => $amount,  // تبدیل تومان → ریال
                 "callbackUrl" => $callbackUrl,
@@ -204,9 +208,12 @@ class PaymentController extends Controller
                     'questions_used' => 0,
                     'expires_at' => now()->addDays(30),
                     'paid' => true,
+                    'paid_amount_toman' => (int) $plan->price,
                 ]
             );
         });
+
+        Cache::forget('admin:financial-current-jalali');
 
         return $this->successfulPaymentRedirect(
             (int) $subscription->user_id,
