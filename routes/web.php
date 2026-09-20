@@ -10,16 +10,16 @@ use Illuminate\Support\Facades\Route;
 
 /* ─────────────────── AUTH ─────────────────── */
 Route::get('/login',    [AuthController::class, 'showLoginForm'])->name('login');
-Route::post('/login',   [AuthController::class, 'login'])->name('login.post');
+Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:5,1')->name('login.post');
 Route::get('/register', [AuthController::class, 'showRegisterForm'])->name('register');
-Route::post('/register',[AuthController::class, 'register'])->name('register.post');
+Route::post('/register', [AuthController::class, 'register'])->middleware('throttle:5,1')->name('register.post');
 Route::post('/logout',  [AuthController::class, 'logout'])->name('logout');
 
 /* ─────────────────── فراموشی رمز عبور (OTP پیامک) ─────────────────── */
 Route::get('/forgot-password',  [PasswordResetController::class, 'showForgetForm'])->name('password.forgot');
-Route::post('/forgot-password', [PasswordResetController::class, 'sendOtp'])->name('password.sendOtp');
+Route::post('/forgot-password', [PasswordResetController::class, 'sendOtp'])->middleware('throttle:3,10')->name('password.sendOtp');
 Route::get('/reset-password',   [PasswordResetController::class, 'showResetForm'])->name('password.resetForm');
-Route::post('/reset-password',  [PasswordResetController::class, 'resetPassword'])->name('password.reset');
+Route::post('/reset-password', [PasswordResetController::class, 'resetPassword'])->middleware('throttle:5,10')->name('password.reset');
 
 /* ─────────────────── جلوگیری از GET روی chat-stream ─────────────────── */
 Route::get('/chat-stream', function () {
