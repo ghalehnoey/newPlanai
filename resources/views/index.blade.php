@@ -166,7 +166,7 @@
                         </span>
                         @endif
                     </div>
-                    <a href="{{ route('plans', [], false) }}"
+                    <a href="https://static.hakimisadr.com/plans"
                        class="flex items-center gap-1 bg-indigo-500 hover:bg-indigo-600 text-white text-xs font-bold px-3 py-1.5 rounded-full transition-smooth whitespace-nowrap">
                         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/></svg>
                         <span>ارتقا پلن</span>

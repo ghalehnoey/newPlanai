@@ -11,6 +11,10 @@ class PlanController extends Controller
 {
     public function index()
     {
+        if (request()->getHost() === 'static.hakimisadr.ir') {
+            return redirect()->to('https://static.hakimisadr.com/plans', 302);
+        }
+
         $plans = Plan::where('is_active', true)
                      ->orderBy('price', 'asc')
                      ->get();

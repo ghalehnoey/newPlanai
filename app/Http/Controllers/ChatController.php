@@ -141,7 +141,7 @@ class ChatController extends BaseController
         if (!$user->canAskQuestion()) {
             $sub = $user->activeSubscription;
             if (!$sub || !$sub->isActive()) {
-                $plansUrl = route('plans');
+                $plansUrl = 'https://static.hakimisadr.com/plans';
                 $error = '<div style="line-height:1.8">'
                     . '<span style="font-size:1.1em">سوال رایگان روزانه شما تمام شد.</span><br>'
                     . '<span style="color:#555">فردا می‌توانید دوباره سوال رایگان بپرسید،</span><br>'
@@ -151,7 +151,7 @@ class ChatController extends BaseController
                     . '</a>'
                     . '</div>';
             } else {
-                $plansUrl = route('plans');
+                $plansUrl = 'https://static.hakimisadr.com/plans';
                 $error = '<a href="' . $plansUrl . '" style="color:#e63946;font-weight:bold;text-decoration:underline;">برای ادامه چت کلیک کنید</a><br>'
                     . '<span style="color:#000">سؤالات مجاز اشتراک شما تمام شده</span><br>'
                     . '<span style="color:#000">وب سایت دکتر حکیمی صدر</span>';
