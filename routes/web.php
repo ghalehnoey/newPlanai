@@ -6,6 +6,7 @@ use App\Http\Controllers\PlanController;
 use App\Http\Controllers\PaymentController;
 use App\Http\Controllers\AdminController;
 use App\Http\Controllers\PasswordResetController;
+use App\Http\Controllers\BazaarReceiptController;
 use Illuminate\Support\Facades\Route;
 
 /* ─────────────────── AUTH ─────────────────── */
@@ -42,6 +43,10 @@ Route::middleware('auth')->group(function () {
     Route::get('/plans',                  [PlanController::class, 'index'])->name('plans');
     Route::post('/plan/purchase/{plan}',  [PlanController::class, 'purchase'])->name('plan.purchase');
     Route::post('/payment/start/{plan}',  [PaymentController::class, 'start'])->name('payment.start');
+
+    Route::post('/api/mobile/bazaar/verify', [BazaarReceiptController::class, 'verify'])
+        ->middleware('throttle:30,1')
+        ->name('mobile.bazaar.verify');
 });
 
 // Callback must remain reachable even if the browser session is lost at the bank.

@@ -40,6 +40,11 @@
     </style>
 </head>
 <body class="text-white">
+@php
+    $bazaarModeEnabled = (bool) ($bazaarMode ?? false);
+    $bazaarCheckoutEnabled = $bazaarModeEnabled && (bool) config('services.bazaar.enabled', false);
+    $bazaarPlanProductIds = config('services.bazaar.plan_product_ids', []);
+@endphp
 <div class="container mx-auto px-4 py-10 max-w-5xl">
     @if(session('error'))
         <div role="alert" class="mb-6 rounded-xl border border-red-400/60 bg-red-950/80 px-5 py-4 text-red-100 shadow-lg">
@@ -131,6 +136,22 @@
                     <button class="w-full py-3 rounded-xl bg-green-600/90 text-md font-bold cursor-not-allowed">
                         <i class="fas fa-check ml-2"></i> پلن فعال
                     </button>
+                @elseif($bazaarModeEnabled && !$bazaarCheckoutEnabled)
+                    <button type="button" disabled class="w-full py-3 rounded-xl bg-slate-600/80 text-md font-bold cursor-not-allowed">
+                        پرداخت بازار در حال آماده‌سازی است
+                    </button>
+                @elseif($bazaarCheckoutEnabled && !empty($bazaarPlanProductIds[$plan->id]))
+                    <button type="button"
+                            class="btn-gradient w-full py-3 rounded-xl text-lg font-bold"
+                            data-bazaar-product="{{ $bazaarPlanProductIds[$plan->id] }}"
+                            data-bazaar-subscription="1"
+                            data-bazaar-payload="user:{{ auth()->id() }}|plan:{{ $plan->id }}">
+                        <i class="fas fa-credit-card ml-2"></i> خرید از بازار
+                    </button>
+                @elseif($bazaarModeEnabled)
+                    <button type="button" disabled class="w-full py-3 rounded-xl bg-slate-600/80 text-md font-bold cursor-not-allowed">
+                        محصول بازار برای این پلن تعریف نشده
+                    </button>
                 @else
                     <form action="{{ route('payment.start', $plan) }}" method="POST">
                         @csrf
@@ -155,5 +176,6 @@
         </a>
     </div>
 </div>
+@include('bazaar-mode')
 </body>
 </html>

@@ -1,5 +1,17 @@
 <?php
 
+$bazaarPlanProductIds = [];
+$bazaarProductPlanIds = [];
+foreach (explode(',', (string) env('BAZAAR_PLAN_PRODUCT_IDS', '')) as $pair) {
+    [$planId, $productId] = array_pad(explode(':', trim($pair), 2), 2, null);
+    $planId = filter_var($planId, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+    $productId = is_string($productId) ? trim($productId) : '';
+    if ($planId && preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/', $productId)) {
+        $bazaarPlanProductIds[(int) $planId] = $productId;
+        $bazaarProductPlanIds[$productId] = (int) $planId;
+    }
+}
+
 return [
 
     /*
@@ -125,6 +137,15 @@ return [
         'key' => env('GEMINI_API_KEY'),
         'model' => env('GEMINI_MODEL', 'gemini-2.0-flash-exp'),
         'base_url' => env('GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta'),
+    ],
+
+    'bazaar' => [
+        // Keep this false until the product mapping and server access token are set.
+        'enabled' => env('BAZAAR_ENABLED', false),
+        'package_name' => env('BAZAAR_PACKAGE_NAME', 'com.hakimisadr.smartlawyer'),
+        'access_token' => env('BAZAAR_ACCESS_TOKEN'),
+        'plan_product_ids' => $bazaarPlanProductIds,
+        'product_plan_ids' => $bazaarProductPlanIds,
     ],
 
 ];

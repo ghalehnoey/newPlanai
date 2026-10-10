@@ -31,6 +31,12 @@ return Application::configure(basePath: dirname(__DIR__))
             '193.24.119.0/29'
         ]);
 
+        // Opt-in Bazaar mode is enabled only for the app's signed WebView user-agent.
+        // It runs after Laravel's normal web session middleware.
+        $middleware->web(append: [
+            \App\Http\Middleware\BazaarAppModeMiddleware::class,
+        ]);
+
         $middleware->alias([
             'subscription' => \App\Http\Middleware\CheckSubscription::class,
             'admin'        => \App\Http\Middleware\AdminMiddleware::class,

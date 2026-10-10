@@ -15,7 +15,13 @@ class Subscription extends Model
         'expires_at',
         'zibal_track_id',
         'paid',
-        'paid_amount_toman'
+        'paid_amount_toman',
+        'gateway',
+        'bazaar_purchase_token',
+        'bazaar_order_id',
+        'bazaar_product_id',
+        'bazaar_payload',
+        'bazaar_receipt',
     ];
 
     protected $casts = [
