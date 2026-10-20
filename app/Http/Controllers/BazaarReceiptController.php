@@ -4,9 +4,9 @@ namespace App\Http\Controllers;
 
 use App\Models\Plan;
 use App\Models\Subscription;
+use App\Services\BazaarSubscriptionVerifier;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
 class BazaarReceiptController extends Controller
@@ -52,79 +52,88 @@ class BazaarReceiptController extends Controller
         $plan = $planId ? Plan::whereKey($planId)->where('is_active', true)->first() : null;
         abort_unless($plan, 422, 'invalid or unmapped product');
 
-        $apiUrl = sprintf(
-            'https://api.cafebazaar.ir/api/v2/payments/%s/tokens/%s/',
-            rawurlencode($packageName),
-            rawurlencode($data['purchase_token'])
-        );
-
         try {
-            $bazaar = Http::withToken($accessToken)
-                ->acceptJson()
-                ->connectTimeout(10)
-                ->timeout(20)
-                ->get($apiUrl);
+            $verification = app(BazaarSubscriptionVerifier::class)->verify(
+                $packageName,
+                $data['product_id'],
+                $data['purchase_token'],
+                $accessToken
+            );
         } catch (\Throwable $e) {
-            Log::error('Bazaar receipt request failed', ['error' => $e->getMessage()]);
+            Log::error('Bazaar receipt request failed', ['exception' => get_class($e)]);
             return response()->json([
                 'ok' => false,
                 'consume' => false,
-                'message' => 'receipt validation unavailable',
+                'message' => 'ارتباط با سرور پرداخت بازار برقرار نشد. لطفاً دوباره تلاش کنید.',
             ], 502);
         }
 
-        if (!$bazaar->successful()) {
-            Log::warning('Bazaar receipt validation rejected', ['status' => $bazaar->status()]);
+        if (!$verification['ok']) {
+            Log::warning('Bazaar receipt validation rejected', ['status' => $verification['status']]);
             return response()->json([
                 'ok' => false,
                 'consume' => false,
-                'message' => 'receipt validation failed',
+                'message' => $verification['message'],
             ], 422);
         }
 
-        $receipt = $bazaar->json();
-        $receiptState = (int) data_get($receipt, 'purchaseState', -1);
-        $receiptProduct = data_get($receipt, 'productId', data_get($receipt, 'product_id'));
-        if ($receiptState !== 0 || $receiptProduct !== $data['product_id']) {
-            return response()->json([
-                'ok' => false,
-                'consume' => false,
-                'message' => 'receipt is not a valid purchase',
-            ], 422);
-        }
-
+        $receipt = $verification['receipt'];
+        $receipt['verifiedPurchaseToken'] = $data['purchase_token'];
+        $expiresAt = $verification['expires_at'];
         $user = $request->user();
-        $token = $data['purchase_token'];
-        $existing = Subscription::where('bazaar_purchase_token', $token)->first();
-        if ($existing) {
-            if ((int) $existing->user_id !== (int) $user->id) {
-                Log::warning('Bazaar token replayed by another user', ['subscription_id' => $existing->id]);
-                return response()->json(['ok' => false, 'consume' => false, 'message' => 'purchase token already used'], 409);
+        // Renewal tokens share a stable subscription identity. Restoring a
+        // receipt must not add another month or reset the question allowance.
+        $token = $verification['linked_subscription_token'];
+        try {
+            $result = DB::transaction(function () use ($data, $plan, $user, $receipt, $token, $expiresAt) {
+                $user->newQuery()->whereKey($user->id)->lockForUpdate()->firstOrFail();
+                $existing = Subscription::whereIn('bazaar_purchase_token', [$token, $data['purchase_token']])
+                    ->lockForUpdate()->first();
+                if ($existing && (int) $existing->user_id !== (int) $user->id) {
+                    return 'conflict';
+                }
+                if ($existing && $existing->expires_at && !$expiresAt->greaterThan($existing->expires_at)) {
+                    return 'already_granted';
+                }
+                $values = [
+                    'user_id' => $user->id,
+                    'plan_id' => $plan->id,
+                    'questions_used' => 0,
+                    'expires_at' => $expiresAt,
+                    'paid' => true,
+                    'paid_amount_toman' => (int) $plan->price,
+                    'gateway' => 'cafebazaar',
+                    'bazaar_purchase_token' => $token,
+                    'bazaar_order_id' => $data['order_id'] ?? null,
+                    'bazaar_product_id' => $data['product_id'],
+                    'bazaar_payload' => $data['payload'] ?? null,
+                    'bazaar_receipt' => json_encode($receipt, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+                ];
+                if ($existing) {
+                    $existing->update($values);
+                } else {
+                    Subscription::create($values);
+                }
+                return 'granted';
+            }, 3);
+        } catch (\Illuminate\Database\QueryException $e) {
+            // Enforce the unique token even across concurrent website accounts.
+            if ($e->getCode() !== '23000') {
+                throw $e;
             }
-
-            return response()->json([
-                'ok' => true,
-                'consume' => false,
-                'message' => 'receipt already granted',
-            ]);
+            $existing = Subscription::where('bazaar_purchase_token', $token)->first();
+            if (!$existing) {
+                throw $e;
+            }
+            $result = (int) $existing->user_id === (int) $user->id ? 'already_granted' : 'conflict';
         }
-
-        DB::transaction(function () use ($data, $plan, $user, $receipt, $token) {
-            Subscription::create([
-                'user_id' => $user->id,
-                'plan_id' => $plan->id,
-                'questions_used' => 0,
-                'expires_at' => now()->addDays(30),
-                'paid' => true,
-                'paid_amount_toman' => (int) $plan->price,
-                'gateway' => 'cafebazaar',
-                'bazaar_purchase_token' => $token,
-                'bazaar_order_id' => $data['order_id'] ?? null,
-                'bazaar_product_id' => $data['product_id'],
-                'bazaar_payload' => $data['payload'] ?? null,
-                'bazaar_receipt' => json_encode($receipt, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
-            ]);
-        });
+        if ($result === 'conflict') {
+            return response()->json([
+                'ok' => false,
+                'consume' => false,
+                'message' => 'این خرید قبلاً به حساب دیگری متصل شده است.',
+            ], 409);
+        }
 
         return response()->json([
             'ok' => true,

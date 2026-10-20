@@ -46,6 +46,7 @@
     $bazaarPlanProductIds = config('services.bazaar.plan_product_ids', []);
 @endphp
 <div class="container mx-auto px-4 py-10 max-w-5xl">
+    @include('bazaar-mode')
     @if(session('error'))
         <div role="alert" class="mb-6 rounded-xl border border-red-400/60 bg-red-950/80 px-5 py-4 text-red-100 shadow-lg">
             {{ session('error') }}
@@ -136,6 +137,10 @@
                     <button class="w-full py-3 rounded-xl bg-green-600/90 text-md font-bold cursor-not-allowed">
                         <i class="fas fa-check ml-2"></i> پلن فعال
                     </button>
+                @elseif($bazaarModeEnabled && !($bazaarVersionSupported ?? true))
+                    <button type="button" disabled class="w-full py-3 rounded-xl bg-slate-600/80 text-md font-bold cursor-not-allowed">
+                        برای خرید، اپلیکیشن را به نسخه جدید به‌روز کنید
+                    </button>
                 @elseif($bazaarModeEnabled && !$bazaarCheckoutEnabled)
                     <button type="button" disabled class="w-full py-3 rounded-xl bg-slate-600/80 text-md font-bold cursor-not-allowed">
                         پرداخت بازار در حال آماده‌سازی است
@@ -176,6 +181,5 @@
         </a>
     </div>
 </div>
-@include('bazaar-mode')
 </body>
 </html>
