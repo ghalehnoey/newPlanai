@@ -9,6 +9,8 @@ class AiUsageLog extends Model
     protected $fillable = [
         'request_id', 'user_id', 'conversation_id', 'user_message_id', 'assistant_message_id',
         'requested_model', 'used_model', 'provider', 'model_mapping', 'route',
+        'smart_routed', 'routing_reason',
+        'finish_reason', 'continuation_count',
         'input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_tokens', 'total_tokens',
         'input_price_per_million', 'cached_input_price_per_million', 'output_price_per_million',
         'estimated_cost_usd', 'usage_source', 'elapsed_ms',
@@ -25,5 +27,7 @@ class AiUsageLog extends Model
         'output_price_per_million' => 'decimal:6',
         'estimated_cost_usd' => 'decimal:8',
         'elapsed_ms' => 'integer',
+        'continuation_count' => 'integer',
+        'smart_routed' => 'boolean',
     ];
 }

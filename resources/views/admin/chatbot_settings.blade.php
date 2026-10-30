@@ -5,7 +5,7 @@
 <div class="mb-6 flex items-center justify-between flex-wrap gap-3">
     <div>
         <h1 class="text-2xl font-bold text-slate-800 dark:text-white">تنظیمات چت‌بات</h1>
-        <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">ویرایش پرامپت سیستمی و محدوده پاسخگویی هوش مصنوعی</p>
+        <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">ویرایش پرامپت، محدوده پاسخگویی و سقف طول پاسخ هوش مصنوعی</p>
     </div>
 </div>
 
@@ -37,6 +37,29 @@
                 <textarea name="topic_restriction" rows="5"
                     class="w-full border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 resize-y bg-slate-50 dark:bg-slate-900 dark:text-slate-100"
                     dir="rtl" placeholder="مثال: فقط به سوالات حقوقی پاسخ بدهد. سوالات پزشکی، برنامه‌نویسی و غیرمرتبط را رد کند.">{{ old('topic_restriction', $topicRestriction) }}</textarea>
+            </div>
+
+            {{-- Default output limit --}}
+            <div class="bg-white dark:bg-slate-800 rounded-2xl border border-slate-100 dark:border-slate-700 shadow-sm p-5">
+                <label for="defaultMaxOutputTokens" class="text-sm font-bold text-slate-700 dark:text-slate-200 block mb-1">
+                    سقف پیش‌فرض توکن خروجی
+                </label>
+                <p class="text-xs text-slate-400 mb-3">
+                    حداکثر طول هر بخش از پاسخ هوش مصنوعی. مقدار بیشتر پاسخ کامل‌تری می‌دهد، اما هزینه و زمان پاسخ را افزایش می‌دهد. مقدار پیشنهادی: ۴۰۰۰.
+                </p>
+                <div class="flex items-center gap-3 max-w-md">
+                    <input type="number" name="ai_default_max_output_tokens" id="defaultMaxOutputTokens"
+                        value="{{ old('ai_default_max_output_tokens', $defaultMaxOutputTokens) }}"
+                        min="100" max="100000" step="100" required dir="ltr"
+                        class="w-full border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300 bg-slate-50 dark:bg-slate-900 dark:text-slate-100">
+                    <span class="text-xs text-slate-500 whitespace-nowrap">توکن</span>
+                </div>
+                @error('ai_default_max_output_tokens')
+                    <p class="text-red-500 text-xs mt-1">{{ $message }}</p>
+                @enderror
+                <p class="text-xs text-amber-600 dark:text-amber-400 mt-3">
+                    اگر برای یک مدل در صفحه «مدل‌های هوش مصنوعی» سقف کمتری ثبت شده باشد، مقدار همان مدل اعمال می‌شود.
+                </p>
             </div>
 
             <div class="flex flex-wrap gap-3">
@@ -91,6 +114,12 @@
                     <span>محدوده موضوعی:</span>
                     <span class="font-semibold {{ $topicRestriction ? 'text-green-600' : 'text-slate-400' }}">
                         {{ $topicRestriction ? 'تنظیم شده' : 'تنظیم نشده' }}
+                    </span>
+                </div>
+                <div class="flex justify-between">
+                    <span>سقف پیش‌فرض پاسخ:</span>
+                    <span class="font-mono font-semibold text-indigo-600 dark:text-indigo-400">
+                        {{ number_format($defaultMaxOutputTokens) }} توکن
                     </span>
                 </div>
             </div>

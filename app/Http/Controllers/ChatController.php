@@ -12,6 +12,7 @@ use App\Services\ConversationService;
 use App\Services\ConversationMemoryService;
 use App\Services\FileService;
 use App\Services\SystemPromptService;
+use App\Services\SmartModelRouter;
 use GuzzleHttp\Client;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller as BaseController;
@@ -33,6 +34,7 @@ class ChatController extends BaseController
         private FileService         $fileService,
         private ConversationService $conversationService,
         private ConversationMemoryService $conversationMemoryService,
+        private SmartModelRouter $smartModelRouter,
     ) {
         $this->middleware('auth');
     }
@@ -40,6 +42,7 @@ class ChatController extends BaseController
     public function index()
     {
         $models = AiModel::where('is_active', true)
+            ->where('key', '!=', SmartModelRouter::TARGET_MODEL_KEY)
             ->orderBy('sort_order')
             ->get(['key', 'name', 'title', 'supports_files']);
 
@@ -293,6 +296,21 @@ class ChatController extends BaseController
                 ->all();
         }
 
+        $smartRouting = $this->smartModelRouter->decide(
+            $messageText,
+            $modelKey,
+            !empty($aiFileModels),
+        );
+        $effectiveModelKey = $smartRouting['effective_model'];
+
+        Log::info('Smart model routing decision', [
+            'request_id' => $request->attributes->get('chat_request_id'),
+            'requested_model' => $modelKey,
+            'effective_model' => $effectiveModelKey,
+            'routed' => $smartRouting['routed'],
+            'reason' => $smartRouting['reason'],
+        ]);
+
         $systemPrompt = (string) $this->systemPromptService->getSystemPrompt();
         if ($memoryContext['memory_used']) {
             $systemPrompt .= "\n\nقاعده حافظه: بخشی با عنوان «حافظه فشرده محلی» ممکن است همراه تاریخچه بیاید. "
@@ -322,7 +340,7 @@ class ChatController extends BaseController
         return response()->stream(function () use (
             $conversation, $messageText, $aiFileModels, $systemPrompt, $previousChatMessages,
             $subscription, $isFreeQuestion, $user, $modelKey, $userMessage,
-            $protocolV2, $requestId, $historyWasLimited
+            $protocolV2, $requestId, $historyWasLimited, $effectiveModelKey, $smartRouting
         ) {
             if (ob_get_level()) {
                 ob_end_clean();
@@ -348,20 +366,20 @@ class ChatController extends BaseController
             if ($historyWasLimited) {
                 $emit('notice', ['code' => 'context_trimmed']);
             }
-            $usedModelKey = $modelKey;
+            $usedModelKey = $effectiveModelKey;
             $assistantAnswer = '';
             $usageDetails = null;
             try {
                 $this->aiApiService->stream(
-                    $messageText, $modelKey, $systemPrompt, $previousChatMessages, $aiFileModels,
+                    $messageText, $effectiveModelKey, $systemPrompt, $previousChatMessages, $aiFileModels,
                     static function (string $chunk) use (&$assistantAnswer, $emit): void {
                         $assistantAnswer .= $chunk;
                         $emit('delta', ['text' => $chunk]);
                     },
-                    static function (string $code, array $details = []) use ($emit, &$usedModelKey, $modelKey): void {
+                    static function (string $code, array $details = []) use ($emit, &$usedModelKey, $effectiveModelKey): void {
                         if ($code === 'model_selected') {
-                            $usedModelKey = (string) ($details['key'] ?? $modelKey);
-                            if ($usedModelKey !== $modelKey) {
+                            $usedModelKey = (string) ($details['key'] ?? $effectiveModelKey);
+                            if ($usedModelKey !== $effectiveModelKey) {
                                 $emit('notice', ['code' => 'model_fallback', 'name' => $details['name'] ?: $usedModelKey]);
                             }
                             return;
@@ -380,7 +398,7 @@ class ChatController extends BaseController
                 // A response is complete only after persistence and quota accounting succeed.
                 $answer = DB::transaction(function () use (
                     $conversation, $user, $usedModelKey, $assistantAnswer, $subscription, $isFreeQuestion,
-                    $usageDetails, $requestId, $modelKey, $userMessage
+                    $usageDetails, $requestId, $modelKey, $userMessage, $effectiveModelKey, $smartRouting
                 ) {
                     $answer = Message::create([
                         'conversation_id' => $conversation->id,
@@ -407,6 +425,7 @@ class ChatController extends BaseController
                             + $cachedTokens * $cachedPrice
                             + $outputTokens * $outputPrice) / 1000000;
 
+                        $actualUsedModel = (string) ($usageDetails['used_model'] ?? $usedModelKey);
                         AiUsageLog::create([
                             'request_id' => $requestId,
                             'user_id' => $user->id,
@@ -414,10 +433,14 @@ class ChatController extends BaseController
                             'user_message_id' => $userMessage->id,
                             'assistant_message_id' => $answer->id,
                             'requested_model' => $modelKey,
-                            'used_model' => $usageDetails['used_model'] ?? $usedModelKey,
+                            'used_model' => $actualUsedModel,
+                            'smart_routed' => (bool) $smartRouting['routed'] && $actualUsedModel === $effectiveModelKey,
+                            'routing_reason' => $smartRouting['routed'] ? $smartRouting['reason'] : null,
                             'provider' => $usageDetails['provider'] ?? null,
                             'model_mapping' => $usageDetails['model_mapping'] ?? null,
                             'route' => $usageDetails['route'] ?? null,
+                            'finish_reason' => $usageDetails['finish_reason'] ?? null,
+                            'continuation_count' => max(0, (int) ($usageDetails['continuation_count'] ?? 0)),
                             'input_tokens' => $inputTokens,
                             'cached_input_tokens' => $cachedTokens,
                             'output_tokens' => $outputTokens,

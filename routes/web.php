@@ -87,6 +87,9 @@ Route::middleware(['auth', 'manager'])->prefix('admin')->name('admin.')->group(f
     Route::post('/system/memory/reset',        [AdminController::class, 'resetConversationMemories'])->name('system.memory.reset');
     Route::get('/ai-test',                    [AdminController::class, 'aiTest'])->name('ai-test');
     Route::get('/ai-usage',                   [AdminController::class, 'aiUsage'])->name('ai-usage');
+    Route::get('/calendar/config',            [AdminController::class, 'calendarConfig'])->name('calendar.config');
+    Route::get('/calendar/month',             [AdminController::class, 'calendarMonth'])->name('calendar.month');
+    Route::get('/subscriber-economics',        [AdminController::class, 'subscriberEconomics'])->name('subscriber-economics');
     Route::get('/ai-errors',                  [AdminController::class, 'aiErrors'])->name('ai-errors');
     Route::post('/ai-test/run',               [AdminController::class, 'aiTestRun'])->name('ai-test.run');
     Route::get('/chatbot-settings',           [AdminController::class, 'chatbotSettings'])->name('chatbot-settings');

@@ -34,6 +34,60 @@
     @enderror
 </div>
 
+{{-- مسیریابی هوشمند مدل کم‌هزینه --}}
+<div class="bg-white rounded-2xl border border-emerald-100 shadow-sm p-5 mb-6">
+    <div class="flex flex-wrap items-start justify-between gap-3 mb-5">
+        <div>
+            <h3 class="font-semibold text-slate-800 mb-1">مسیریابی هوشمند به مدل کم‌هزینه</h3>
+            <p class="text-xs text-slate-500 leading-6 max-w-3xl">
+                سؤال‌های ساده، خلاصه‌سازی و پرسش‌های متداول به <span dir="ltr" class="font-semibold">GPT-5.4 mini</span> می‌روند.
+                تشخیص روی همین سرور و بدون درخواست API اضافه انجام می‌شود. درخواست فایل‌دار، تنظیم متن حقوقی، تحلیل پرونده و محاسبه همیشه روی مدل اصلی می‌ماند.
+            </p>
+        </div>
+        <span class="rounded-full px-3 py-1 text-xs font-semibold {{ $smartRoutingSettings['ai_smart_routing_enabled'] ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600' }}">
+            {{ $smartRoutingSettings['ai_smart_routing_enabled'] ? 'فعال' : 'غیرفعال برای آزمایش امن' }}
+        </span>
+    </div>
+
+    <form method="POST" action="{{ route('admin.system.settings.save') }}" class="space-y-4">
+        @csrf
+        <input type="hidden" name="ai_smart_routing_enabled" value="0">
+        <label class="flex items-center gap-3 rounded-xl border border-slate-100 bg-slate-50 p-4 cursor-pointer">
+            <input type="checkbox" name="ai_smart_routing_enabled" value="1" {{ old('ai_smart_routing_enabled', $smartRoutingSettings['ai_smart_routing_enabled']) ? 'checked' : '' }} class="h-5 w-5 accent-emerald-600">
+            <span>
+                <strong class="block text-sm text-slate-800">فعال‌کردن مسیریاب کم‌هزینه</strong>
+                <span class="text-xs text-slate-500">در صورت خطای mini، سامانه خودکار به مدل اصلی برمی‌گردد.</span>
+            </span>
+        </label>
+
+        <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
+            <label class="block">
+                <span class="mb-1 block text-xs font-semibold text-slate-600">حداکثر طول متن قابل مسیریابی</span>
+                <input type="number" name="ai_smart_routing_max_characters" value="{{ old('ai_smart_routing_max_characters', $smartRoutingSettings['ai_smart_routing_max_characters']) }}" min="200" max="4000" step="100" class="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm">
+                <span class="mt-1 block text-xs text-slate-400">کاراکتر؛ مقدار محافظه‌کارانه پیشنهادی: ۱۵۰۰</span>
+            </label>
+            <div class="rounded-xl border border-slate-100 p-3">
+                <span class="block text-xs text-slate-400">مدل داخلی</span>
+                <strong class="mt-1 block text-sm text-slate-800" dir="ltr">{{ $smartRoutingModel?->model_mapping ?? 'gpt-5.4-mini' }}</strong>
+                <span class="mt-1 block text-xs {{ $smartRoutingModel?->is_active ? 'text-emerald-600' : 'text-red-600' }}">{{ $smartRoutingModel?->is_active ? 'آماده پاسخ‌گویی' : 'مدل در دسترس نیست' }}</span>
+            </div>
+            <div class="rounded-xl border border-slate-100 p-3">
+                <span class="block text-xs text-slate-400">۷ روز اخیر پس از فعال‌سازی</span>
+                <strong class="mt-1 block text-sm text-slate-800">{{ number_format($smartRoutingStats->requests ?? 0) }} درخواست</strong>
+                <span class="mt-1 block text-xs text-slate-500">{{ number_format($smartRoutingStats->tokens ?? 0) }} توکن ـ ${{ number_format((float) ($smartRoutingStats->cost_usd ?? 0), 4) }}</span>
+            </div>
+        </div>
+
+        <div class="rounded-lg bg-amber-50 p-3 text-xs leading-6 text-amber-800">
+            سهمیه رایگان روزانه مربوط به برنامه اشتراک‌گذاری داده حساب OpenAI شماست؛ بعد از تمام‌شدن سهمیه، مصرف با نرخ عادی محاسبه می‌شود. فعال‌بودن آن برنامه را از تنظیمات حساب OpenAI کنترل کنید.
+        </div>
+        @if($errors->hasAny(['ai_smart_routing_enabled','ai_smart_routing_max_characters']))
+            <div class="rounded-lg bg-red-50 p-3 text-xs text-red-700">مقدار تنظیمات مسیریاب معتبر نیست.</div>
+        @endif
+        <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold px-5 py-2.5 rounded-lg transition">ذخیره تنظیمات مسیریاب</button>
+    </form>
+</div>
+
 <div class="bg-white rounded-2xl border border-indigo-100 shadow-sm p-5 mb-6">
     <div class="flex flex-wrap items-start justify-between gap-3 mb-5">
         <div>
@@ -101,15 +155,23 @@
 </div>
 
 <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 mb-6">
-    <h3 class="font-semibold text-slate-800 mb-1">نرخ تبدیل هزینه هوش مصنوعی</h3>
-    <p class="text-xs text-slate-400 mb-4">قیمت هر دلار به تومان برای تبدیل هزینه API و محاسبه سود تقریبی ماه شمسی. صفر = فقط نمایش هزینه دلاری.</p>
-    <form method="POST" action="{{ route('admin.system.settings.save') }}" class="flex flex-wrap items-center gap-3">
+    <h3 class="font-semibold text-slate-800 mb-1">بودجه و نرخ تبدیل هزینه هوش مصنوعی</h3>
+    <p class="text-xs text-slate-400 mb-4">سقف روزانه مبنای نوار مصرف داشبورد است؛ صفر یعنی بدون سقف نمایشی. این مقدار محدودیت فنی هر مدل را تغییر نمی‌دهد.</p>
+    <form method="POST" action="{{ route('admin.system.settings.save') }}" class="flex flex-wrap items-end gap-4">
         @csrf
-        <input type="number" name="usd_to_toman_rate" value="{{ old('usd_to_toman_rate', $usdToTomanRate) }}" min="0" max="100000000" step="1"
-               class="w-40 border border-slate-200 rounded-lg px-3 py-2 text-sm text-center focus:outline-none focus:ring-2 focus:ring-blue-400" dir="ltr">
+        <label class="block">
+            <span class="mb-1 block text-xs font-semibold text-slate-600">بودجه روزانه AI</span>
+            <div class="flex items-center gap-2"><input type="number" name="ai_daily_budget_usd" value="{{ old('ai_daily_budget_usd', $aiDailyBudgetUsd) }}" min="0" max="1000000" step="0.01"
+                   class="w-36 border border-slate-200 rounded-lg px-3 py-2 text-sm text-center focus:outline-none focus:ring-2 focus:ring-blue-400" dir="ltr"><span class="text-xs text-slate-400">دلار</span></div>
+        </label>
+        <label class="block">
+            <span class="mb-1 block text-xs font-semibold text-slate-600">نرخ هر دلار</span>
+            <div class="flex items-center gap-2"><input type="number" name="usd_to_toman_rate" value="{{ old('usd_to_toman_rate', $usdToTomanRate) }}" min="0" max="100000000" step="1"
+                   class="w-40 border border-slate-200 rounded-lg px-3 py-2 text-sm text-center focus:outline-none focus:ring-2 focus:ring-blue-400" dir="ltr"><span class="text-xs text-slate-400">تومان</span></div>
+        </label>
         <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-2 rounded-lg transition">ذخیره</button>
-        <span class="text-xs text-slate-400">تومان برای هر دلار</span>
     </form>
+    @error('ai_daily_budget_usd')<p class="mt-2 text-red-500 text-xs">{{ $message }}</p>@enderror
     @error('usd_to_toman_rate')<p class="mt-2 text-red-500 text-xs">{{ $message }}</p>@enderror
 </div>
 

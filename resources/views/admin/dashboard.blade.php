@@ -26,6 +26,48 @@
 </div>
 @endif
 
+@if(auth()->user()->role === 'manager' && $aiDailyUsage)
+@php
+    $dailyPercent = (float) $aiDailyUsage['percentage'];
+    $dailyBarClass = $dailyPercent >= 90 ? 'bg-rose-500' : ($dailyPercent >= 70 ? 'bg-amber-500' : 'bg-emerald-500');
+    $dailyTextClass = $dailyPercent >= 90 ? 'text-rose-700' : ($dailyPercent >= 70 ? 'text-amber-700' : 'text-emerald-700');
+    $yesterdayDifference = (float) $aiDailyUsage['cost_usd'] - (float) $aiDailyUsage['yesterday_cost_usd'];
+@endphp
+<div class="mb-6 rounded-2xl border border-emerald-100 bg-white p-5 shadow-sm">
+    <div class="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div>
+            <h2 class="font-bold text-slate-800">مصرف امروز هوش مصنوعی</h2>
+            <p class="mt-1 text-xs text-slate-500">امروز {{ $aiDailyUsage['date'] }} به وقت تهران ـ فقط مدیر کل</p>
+        </div>
+        <div class="flex gap-2"><a href="{{ route('admin.subscriber-economics') }}" class="rounded-lg bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700 hover:bg-emerald-100">اقتصاد مشترکان</a><a href="{{ route('admin.ai-usage') }}" class="rounded-lg bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-700 hover:bg-indigo-100">گزارش بازه‌ای</a></div>
+    </div>
+    <div class="grid gap-4 lg:grid-cols-[1fr_auto] lg:items-end">
+        <div>
+            <div class="mb-2 flex flex-wrap items-end justify-between gap-2">
+                <div>
+                    <span class="text-3xl font-black {{ $dailyTextClass }}" dir="ltr">${{ number_format($aiDailyUsage['cost_usd'], 4) }}</span>
+                    <span class="text-sm text-slate-400" dir="ltr">
+                        / {{ $aiDailyUsage['budget_usd'] > 0 ? '$'.number_format($aiDailyUsage['budget_usd'], 2) : 'بدون سقف' }}
+                    </span>
+                </div>
+                <span class="text-sm font-bold {{ $dailyTextClass }}">{{ $aiDailyUsage['budget_usd'] > 0 ? number_format($dailyPercent, 1).'٪' : 'نامحدود' }}</span>
+            </div>
+            <div class="h-3 overflow-hidden rounded-full bg-slate-100" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ min(100, round($dailyPercent)) }}">
+                <div class="h-full rounded-full {{ $dailyBarClass }} transition-all" style="width: {{ $aiDailyUsage['bar_percentage'] }}%"></div>
+            </div>
+            <div class="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs text-slate-500">
+                <span>{{ number_format($aiDailyUsage['requests']) }} درخواست</span>
+                <span>{{ number_format($aiDailyUsage['tokens']) }} توکن</span>
+                <span class="{{ $yesterdayDifference > 0 ? 'text-amber-600' : 'text-emerald-600' }}" dir="ltr">
+                    {{ $yesterdayDifference >= 0 ? '+' : '' }}${{ number_format($yesterdayDifference, 4) }} نسبت به دیروز
+                </span>
+            </div>
+        </div>
+        <a href="{{ route('admin.system') }}" class="text-xs font-semibold text-slate-500 hover:text-indigo-700">تنظیم سقف روزانه</a>
+    </div>
+</div>
+@endif
+
 @if(auth()->user()->role === 'manager' && $financialMonth)
 <div class="mb-6 rounded-2xl border border-indigo-100 bg-gradient-to-l from-indigo-50 to-white p-5 shadow-sm">
     <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
@@ -271,6 +313,9 @@
                     <button class="btn-primary whitespace-nowrap">ذخیره</button>
                 </div>
             </form>
+            <div id="managerPasswordProtectedNotice" class="hidden rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                تغییر رمز حساب مدیر کل برای شما مجاز نیست.
+            </div>
             <hr class="border-slate-100">
             {{-- Change Phone --}}
             <form id="editPhoneForm" method="POST" class="space-y-3">
@@ -398,7 +443,12 @@ async function loadTopUsers() {
 
 function openEditModal(id, name, phone, email, role, planId, expiresAt, questionsUsed) {
     document.getElementById('editUserName').textContent = name;
-    document.getElementById('editPasswordForm').action = `/admin/users/${id}/change-password`;
+    const passwordForm = document.getElementById('editPasswordForm');
+    const passwordProtectedNotice = document.getElementById('managerPasswordProtectedNotice');
+    const cannotChangeManagerPassword = @json(auth()->user()->phone === '09155711123') && role === 'manager';
+    passwordForm.action = `/admin/users/${id}/change-password`;
+    passwordForm.classList.toggle('hidden', cannotChangeManagerPassword);
+    passwordProtectedNotice.classList.toggle('hidden', !cannotChangeManagerPassword);
     document.getElementById('editPhoneForm').action = `/admin/users/${id}/update-phone`;
     document.getElementById('editRoleForm') && (document.getElementById('editRoleForm').action = `/admin/users/${id}/update-role`);
     document.getElementById('editSubForm').action = `/admin/users/${id}/subscription`;

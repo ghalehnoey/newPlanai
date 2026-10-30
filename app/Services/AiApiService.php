@@ -9,6 +9,8 @@ use RuntimeException;
 use Throwable;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use App\Models\AiModel;
 use App\Models\AiFailureLog;
 use App\Models\AiUsageLog;
@@ -19,6 +21,30 @@ class AiApiService
     private const MAX_SINGLE_DOCUMENT_CHARACTERS = 80000;
     private const MAX_PDF_VISION_PAGES_PER_FILE = 12;
     private const MAX_PDF_VISION_PAGES_PER_REQUEST = 20;
+
+    private function defaultMaxOutputTokens(): int
+    {
+        $fallback = 4000;
+
+        try {
+            $fallback = max(100, min(100000, (int) config('services.openai.max_completion_tokens', 4000)));
+        } catch (Throwable) {
+            // The lightweight loopback fixture does not bootstrap Laravel's
+            // container. Production requests still use config and DB below.
+        }
+
+        try {
+            return (int) Cache::remember('ai_default_max_output_tokens', 300, static function () use ($fallback): int {
+                $configured = DB::table('settings')
+                    ->where('key', 'ai_default_max_output_tokens')
+                    ->value('value');
+
+                return max(100, min(100000, (int) ($configured ?? $fallback)));
+            });
+        } catch (Throwable) {
+            return $fallback;
+        }
+    }
 
     public function __construct(
         private FileService $fileService,
@@ -350,7 +376,7 @@ class AiApiService
                     'content' => $userContent,
                 ],
             ],
-            'max_completion_tokens' => 600,
+            'max_completion_tokens' => $this->defaultMaxOutputTokens(),
             'temperature' => 0.7,
             'stream' => false,
         ];
@@ -656,11 +682,12 @@ class AiApiService
         $rawBody = '';
         $receivedContent = false;
         $finished = false;
+        $finishReason = null;
         $streamError = null;
         $retryAfter = null;
         $usage = null;
         $outputText = '';
-        $processLine = static function (string $line) use (&$receivedContent, &$finished, &$streamError, &$usage, &$outputText, $onChunk): void {
+        $processLine = static function (string $line) use (&$receivedContent, &$finished, &$finishReason, &$streamError, &$usage, &$outputText, $onChunk): void {
             $line = trim($line);
 
             if ($line === 'data: [DONE]') {
@@ -678,7 +705,9 @@ class AiApiService
             if (isset($data['error'])) {
                 $streamError = 'upstream_stream_error';
             }
-            if (isset($data['choices'][0]['finish_reason'])) {
+            $candidateFinishReason = $data['choices'][0]['finish_reason'] ?? null;
+            if (is_string($candidateFinishReason) && $candidateFinishReason !== '') {
+                $finishReason = $candidateFinishReason;
                 $finished = true;
             }
             $chunk = $data['choices'][0]['delta']['content'] ?? '';
@@ -791,6 +820,10 @@ class AiApiService
                 $onChunk($content);
             }
             $outputText = $content;
+            $candidateFinishReason = $decoded['choices'][0]['finish_reason'] ?? null;
+            if (is_string($candidateFinishReason) && $candidateFinishReason !== '') {
+                $finishReason = $candidateFinishReason;
+            }
             if (isset($decoded['usage']) && is_array($decoded['usage'])) {
                 $usage = $decoded['usage'];
             }
@@ -799,7 +832,31 @@ class AiApiService
         return [
             'elapsed_ms' => $elapsedMs,
             'usage' => $this->normalizeUsage($usage, $body, $outputText),
+            'output_text' => $outputText,
+            'finish_reason' => $finishReason,
         ];
+    }
+
+    private function finishReasonNeedsContinuation(?string $finishReason): bool
+    {
+        return in_array(strtolower((string) $finishReason), ['length', 'max_tokens'], true);
+    }
+
+    /**
+     * Provider usage is per HTTP request. A continued answer can use more than
+     * one request, so aggregate every segment before persisting cost/usage.
+     */
+    private function mergeUsage(array $total, array $next): array
+    {
+        foreach (['input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_tokens', 'total_tokens'] as $field) {
+            $total[$field] = max(0, (int) ($total[$field] ?? 0)) + max(0, (int) ($next[$field] ?? 0));
+        }
+        $total['source'] = ($total['source'] ?? 'estimated') === 'provider'
+            && ($next['source'] ?? 'estimated') === 'provider'
+                ? 'provider'
+                : 'estimated';
+
+        return $total;
     }
 
     private function supportsStreamUsage(string $url): bool
@@ -970,7 +1027,9 @@ class AiApiService
         }
 
         $query = AiModel::where('is_active', true)
-            ->where('key', '!=', $primaryModelKey);
+            ->where('key', '!=', $primaryModelKey)
+            // Internal cost router model must only be used when explicitly selected.
+            ->where('key', '!=', SmartModelRouter::TARGET_MODEL_KEY);
 
         if ($needsFiles) {
             $query->where('supports_files', true);
@@ -1454,7 +1513,7 @@ class AiApiService
                 $body = $this->applyModelRequestOptions(
                     $modelConfig,
                     $body,
-                    4000,
+                    $this->defaultMaxOutputTokens(),
                     $preferDirectAnswer,
                 );
 
@@ -1565,7 +1624,8 @@ class AiApiService
         $needsFiles = $uploadedFiles !== [];
         $hasStarted = false;
         $lastError = new RuntimeException('No AI response');
-        $deadline = microtime(true) + 150;
+        // Stay below the browser's 180-second request timeout.
+        $deadline = microtime(true) + 170;
         $contextNoticeSent = false;
 
         foreach ($chain as $modelConfig) {
@@ -1598,7 +1658,7 @@ class AiApiService
                 $body = $this->applyModelRequestOptions(
                     $modelConfig,
                     $body,
-                    4000,
+                    $this->defaultMaxOutputTokens(),
                     $this->shouldPreferDirectLegalAnswer($modelConfig, $question, $systemPrompt),
                 );
                 $budget = $this->budgetDecision($modelConfig, $prepared['messages'], $body);
@@ -1644,6 +1704,68 @@ class AiApiService
                                 },
                                 min(120, $remaining),
                             );
+                            $combinedUsage = $result['usage'];
+                            $combinedElapsedMs = (int) $result['elapsed_ms'];
+                            $continuedAnswer = (string) ($result['output_text'] ?? '');
+                            $continuationCount = 0;
+
+                            // Some providers return HTTP 200 and [DONE] even when
+                            // the output limit cuts a sentence in half. Continue
+                            // that answer automatically instead of persisting it
+                            // as a successful but truncated assistant message.
+                            while ($this->finishReasonNeedsContinuation($result['finish_reason'] ?? null)
+                                && $continuationCount < 1) {
+                                $remaining = (int) floor($deadline - microtime(true));
+                                if ($remaining <= 5 || connection_aborted()) {
+                                    throw new AiRequestException(
+                                        'upstream_output_truncated',
+                                        200,
+                                        CURLE_PARTIAL_FILE,
+                                        $combinedElapsedMs,
+                                        '',
+                                    );
+                                }
+                                $continuationCount++;
+                                if ($onStatus) {
+                                    $onStatus('response_continuing');
+                                }
+                                $continuationBody = $body;
+                                $continuationBody['messages'][] = [
+                                    'role' => 'assistant',
+                                    'content' => $continuedAnswer,
+                                ];
+                                $continuationBody['messages'][] = [
+                                    'role' => 'user',
+                                    'content' => 'پاسخ قبلی به سقف خروجی رسید. دقیقاً از همان نقطه و بدون تکرار متن قبلی ادامه بده و پاسخ را کامل کن.',
+                                ];
+                                $nextResult = $this->requestStream(
+                                    $modelConfig,
+                                    $provider['base_url'],
+                                    $provider['api_key'],
+                                    $continuationBody,
+                                    $route,
+                                    static function (string $chunk) use (&$hasStarted, $onChunk): void {
+                                        $hasStarted = true;
+                                        if ($onChunk) {
+                                            $onChunk($chunk);
+                                        }
+                                    },
+                                    min(120, $remaining),
+                                );
+                                $combinedUsage = $this->mergeUsage($combinedUsage, $nextResult['usage']);
+                                $combinedElapsedMs += (int) $nextResult['elapsed_ms'];
+                                $continuedAnswer .= (string) ($nextResult['output_text'] ?? '');
+                                $result = $nextResult;
+                            }
+                            if ($this->finishReasonNeedsContinuation($result['finish_reason'] ?? null)) {
+                                throw new AiRequestException(
+                                    'upstream_output_truncated',
+                                    200,
+                                    CURLE_PARTIAL_FILE,
+                                    $combinedElapsedMs,
+                                    '',
+                                );
+                            }
                             if ($route['type'] === 'direct') {
                                 $this->proxyRouter->markDirectSuccess($modelConfig);
                             } else {
@@ -1655,8 +1777,10 @@ class AiApiService
                                     'provider' => $modelConfig->provider,
                                     'model_mapping' => $this->resolveModel($modelConfig),
                                     'route' => $route['type'],
-                                    'elapsed_ms' => $result['elapsed_ms'],
-                                    'usage' => $result['usage'],
+                                    'elapsed_ms' => $combinedElapsedMs,
+                                    'usage' => $combinedUsage,
+                                    'finish_reason' => $result['finish_reason'] ?? null,
+                                    'continuation_count' => $continuationCount,
                                     'input_price_per_million' => (float) $modelConfig->input_price_per_million,
                                     'cached_input_price_per_million' => (float) $modelConfig->cached_input_price_per_million,
                                     'output_price_per_million' => (float) $modelConfig->output_price_per_million,

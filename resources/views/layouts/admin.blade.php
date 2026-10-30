@@ -6,6 +6,7 @@
     <title>@yield('title', 'پنل مدیریت') | پنل مدیریت</title>
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <link href="{{ asset('css/fonts.css') }}" rel="stylesheet">
+    <link href="{{ asset('vendor/jalali-calendar/jalali-datepicker.css') }}?v=1.0.0" rel="stylesheet">
     <script src="{{ asset('js/tailwind.min.js') }}"></script>
     <script>
         // Apply dark mode before render to prevent flash
@@ -123,6 +124,11 @@
                 مصرف و هزینه AI
             </a>
 
+            <a href="{{ route('admin.subscriber-economics') }}" class="sidebar-link {{ request()->routeIs('admin.subscriber-economics') ? 'active' : '' }}">
+                <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M16 8c0 2.21-1.79 4-4 4S8 10.21 8 8s1.79-4 4-4 4 1.79 4 4zM4 20a8 8 0 0116 0M17 13l2 2 3-3"/></svg>
+                اقتصاد مشترکان
+            </a>
+
             <a href="{{ route('admin.ai-errors') }}" class="sidebar-link {{ request()->routeIs('admin.ai-errors') ? 'active' : '' }}">
                 <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
                 خطاهای هوش مصنوعی
@@ -197,6 +203,25 @@
     </main>
 
     @stack('modals')
+
+    <script src="{{ asset('vendor/jalali-calendar/jalali-datepicker.js') }}?v=1.0.0"></script>
+    <script>
+    (async () => {
+        if (!document.querySelector('input[data-jalali-date]') || typeof JalaliDatePicker === 'undefined') return;
+        try {
+            const response = await fetch({{ Js::from(route('admin.calendar.config', [], false)) }}, {
+                credentials: 'same-origin',
+                cache: 'no-store',
+                headers: { Accept: 'application/json' }
+            });
+            if (!response.ok) throw new Error('Calendar config unavailable');
+            window.adminJalaliDatePicker = new JalaliDatePicker(await response.json());
+        } catch (error) {
+            console.error('Jalali calendar could not be initialized.', error);
+        }
+    })();
+    </script>
+
     @stack('scripts')
 
     <script>

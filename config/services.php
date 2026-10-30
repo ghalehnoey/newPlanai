@@ -100,7 +100,7 @@ return [
         // ??????? ???? ???? ?? ??????
         'timeout' => env('OPENAI_TIMEOUT', 120),
         'connect_timeout' => env('OPENAI_CONNECT_TIMEOUT', 10),
-        'max_completion_tokens' => env('OPENAI_MAX_COMPLETION_TOKENS', 600),
+        'max_completion_tokens' => env('OPENAI_MAX_COMPLETION_TOKENS', 4000),
         'temperature' => env('OPENAI_TEMPERATURE', 0.7),
     ],
 

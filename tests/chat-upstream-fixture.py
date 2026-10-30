@@ -20,7 +20,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.connection.shutdown(socket.SHUT_RDWR)
             return
         status, content, retry = 200, "", None
-        if case in ("partial", "partial_retry"):
+        if case == "truncated":
+            if counts[case] == 1:
+                content = 'data: {"choices":[{"delta":{"content":"first "}}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n'
+            else:
+                content = 'data: {"choices":[{"delta":{"content":"second"}}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+        elif case in ("partial", "partial_retry"):
             content = 'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
         elif case in ("limited", "quota", "long_retry_after") or (case == "ratelimit" and counts[case] == 1):
             status = 429
@@ -51,7 +56,7 @@ $service = new App\Services\AiApiService(new App\Services\FileService(), new Fix
 $direct = new ReflectionMethod($service, 'requestStream');
 $routed = new ReflectionMethod($service, 'streamWithRouting');
 $out=[];
-foreach (['ok','empty','partial','limited','transient','ratelimit','quota','long_retry_after','partial_retry'] as $case) {
+foreach (['ok','empty','partial','limited','transient','ratelimit','quota','long_retry_after','partial_retry','truncated'] as $case) {
     $model = new App\Models\AiModel([
         'key'=>'fixture', 'provider'=>'custom', 'model_mapping'=>'fixture',
         'api_key'=>'fixture-placeholder', 'endpoint'=>getenv('FIXTURE_BASE') . '/' . $case,
@@ -98,7 +103,8 @@ try:
     assert not data["quota"]["ok"] and counts["quota"] == 1, data
     assert not data["long_retry_after"]["ok"] and counts["long_retry_after"] == 1, data
     assert not data["partial_retry"]["ok"] and counts["partial_retry"] == 1, data
-    print(json.dumps({"passed": 9, "loopback_requests": dict(counts)}, sort_keys=True))
+    assert data["truncated"]["ok"] and data["truncated"]["answer"] == "first second" and counts["truncated"] == 2, data
+    print(json.dumps({"passed": 10, "loopback_requests": dict(counts)}, sort_keys=True))
 finally:
     server.shutdown()
     server.server_close()
