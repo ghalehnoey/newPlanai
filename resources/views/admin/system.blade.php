@@ -15,21 +15,32 @@
 {{-- تنظیمات سوال رایگان روزانه --}}
 <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 mb-6">
     <h3 class="font-semibold text-slate-800 mb-1">سوال رایگان روزانه</h3>
-    <p class="text-xs text-slate-400 mb-4">تعداد سوالی که کاربران بدون اشتراک می‌توانند در روز بپرسند. صفر = غیرفعال.</p>
-    <form method="POST" action="{{ route('admin.system.settings.save') }}" class="flex items-center gap-3">
+    <p class="text-xs text-slate-400 mb-4">تعداد سؤال روزانه و مدت فعال‌بودن دسترسی رایگان را تعیین کنید. مدت از اولین پاسخ رایگان کاربر محاسبه می‌شود.</p>
+    <form method="POST" action="{{ route('admin.system.settings.save') }}" class="space-y-4">
         @csrf
-        <input type="number"
-               name="daily_free_questions"
-               value="{{ $dailyFreeQuestions }}"
-               min="0" max="100"
-               class="w-24 border border-slate-200 rounded-lg px-3 py-2 text-sm text-center focus:outline-none focus:ring-2 focus:ring-blue-400">
-        <button type="submit"
-                class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-2 rounded-lg transition">
-            ذخیره
-        </button>
-        <span class="text-xs text-slate-400">سوال در روز</span>
+        <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <label class="block">
+                <span class="mb-1 block text-xs font-semibold text-slate-600">تعداد سؤال در هر روز</span>
+                <input type="number" name="daily_free_questions" value="{{ $dailyFreeQuestions }}" min="0" max="100" class="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm text-center focus:outline-none focus:ring-2 focus:ring-blue-400">
+                <span class="mt-1 block text-xs text-slate-400">صفر = سؤال رایگان غیرفعال</span>
+            </label>
+            <label class="block">
+                <span class="mb-1 block text-xs font-semibold text-slate-600">مدت دسترسی رایگان (روز)</span>
+                <input id="freeAccessDurationDays" type="number" name="free_access_duration_days" value="{{ $freeAccessDurationDays }}" min="0" max="36500" class="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm text-center focus:outline-none focus:ring-2 focus:ring-blue-400">
+                <span class="mt-1 block text-xs text-slate-400">صفر = نامحدود؛ از اولین پاسخ رایگان محاسبه می‌شود</span>
+            </label>
+        </div>
+        <div class="flex flex-wrap gap-2 text-xs">
+            @foreach([1 => '۱ روز', 7 => '۷ روز', 30 => '۱ ماه', 365 => '۱ سال', 0 => 'نامحدود'] as $days => $label)
+                <button type="button" onclick="document.getElementById('freeAccessDurationDays').value='{{ $days }}'" class="rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-blue-700 hover:bg-blue-100">{{ $label }}</button>
+            @endforeach
+        </div>
+        <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-5 py-2 rounded-lg transition">ذخیره تنظیمات دسترسی رایگان</button>
     </form>
     @error('daily_free_questions')
+        <p class="mt-2 text-red-500 text-xs">{{ $message }}</p>
+    @enderror
+    @error('free_access_duration_days')
         <p class="mt-2 text-red-500 text-xs">{{ $message }}</p>
     @enderror
 </div>

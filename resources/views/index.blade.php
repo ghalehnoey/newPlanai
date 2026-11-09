@@ -133,6 +133,10 @@
     @php
         $subscription = auth()->user()?->activeSubscription;
         $remaining    = $subscription ? $subscription->remainingQuestions() : null;
+        $usesDailyFree = !$subscription || $remaining <= 0;
+        $freeAccessActive = $usesDailyFree ? auth()->user()->hasFreeAccess() : false;
+        $freeAccessRemainingDays = $usesDailyFree ? auth()->user()->remainingFreeAccessDays() : null;
+        $freeRemaining = $usesDailyFree && $freeAccessActive ? auth()->user()->remainingFreeQuestions() : 0;
         $daysLeft     = $subscription ? max(0, (int) now()->diffInDays($subscription->expires_at, false)) : null;
         $expiringSoon = $daysLeft !== null && $daysLeft <= 3;
     @endphp
@@ -156,7 +160,7 @@
                     <div class="bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-full text-xs flex items-center gap-2">
                         <span class="text-slate-500 hidden sm:inline">سؤال:</span>
                         <span class="font-bold text-indigo-600">
-                            @if(!$subscription) — @elseif($remaining == 99999) ∞ @else {{ $remaining }} @endif
+                            @if($usesDailyFree)<span id="freeQuestionCounter">رایگان {{ $freeRemaining }}</span>@elseif($remaining == 99999) ∞ @else {{ $remaining }} @endif
                         </span>
                         @if($daysLeft !== null)
                         <span class="text-slate-300 hidden sm:inline">|</span>
@@ -207,6 +211,33 @@
 
     <main class="flex-1 overflow-y-auto" id="chatMain">
         <div class="max-w-3xl mx-auto px-4 py-6">
+            @if($usesDailyFree)
+            <div id="freeTrialBanner" class="mb-5 rounded-2xl border {{ $freeRemaining > 0 ? 'border-indigo-200 bg-indigo-50' : 'border-amber-200 bg-amber-50' }} p-4 text-sm leading-7">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                        <strong id="freeTrialTitle" class="block {{ $freeRemaining > 0 ? 'text-indigo-800' : 'text-amber-800' }}">
+                            @if(!$freeAccessActive)
+                                مدت دسترسی رایگان به پایان رسیده است
+                            @elseif($freeRemaining > 0)
+                                {{ number_format($freeRemaining) }} سؤال رایگان برای امروز باقی مانده است
+                            @else
+                                سؤال‌های رایگان امروز استفاده شده‌اند
+                            @endif
+                        </strong>
+                        <span id="freeTrialDescription" class="text-slate-600">
+                            @if(!$freeAccessActive)
+                                برای ادامه می‌توانید اشتراک تهیه کنید؛ انتقال به صفحه خرید فقط با انتخاب شما انجام می‌شود.
+                            @elseif($freeRemaining > 0)
+                                پس از هر پاسخ تعداد باقی‌مانده به‌روز می‌شود؛ مدت دسترسی: {{ $freeAccessRemainingDays === null ? 'نامحدود' : number_format($freeAccessRemainingDays) . ' روز باقی‌مانده' }}.
+                            @else
+                                سهمیه امروز تمام شده است؛ مدت دسترسی: {{ $freeAccessRemainingDays === null ? 'نامحدود' : number_format($freeAccessRemainingDays) . ' روز باقی‌مانده' }}.
+                            @endif
+                        </span>
+                    </div>
+                    <a href="https://static.hakimisadr.com/plans" class="rounded-xl bg-indigo-600 px-4 py-2 font-bold text-white hover:bg-indigo-700">مشاهده پلن‌ها</a>
+                </div>
+            </div>
+            @endif
             <div id="chatBox" class="space-y-5">
                 <div class="text-center text-slate-400 py-8">در حال بارگذاری...</div>
             </div>

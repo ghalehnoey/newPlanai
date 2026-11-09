@@ -215,8 +215,8 @@ function httpChatError(status, data = {}) {
         action: {label: 'ورود دوباره', href: '/login'}
     };
     if (status === 403) return {
-        message: data.code === 'quota_exceeded' ? 'سهمیهٔ پرسش شما تمام شده است. وضعیت اشتراک را بررسی کنید؛ متن سؤال محفوظ است.' : 'اجازهٔ انجام این درخواست را ندارید. وضعیت حساب خود را بررسی کنید.',
-        action: {label: 'بررسی اشتراک', href: '/plans'}
+        message: data.code === 'quota_exceeded' ? String(data.message || 'سهمیهٔ پرسش شما تمام شده است. متن سؤال محفوظ است.') : 'اجازهٔ انجام این درخواست را ندارید. وضعیت حساب خود را بررسی کنید.',
+        action: {label: 'خرید اشتراک و ادامه', href: String(data.upgrade_url || '/plans')}
     };
     if (status === 422) return {message: String(data.error || Object.values(data.errors || {}).flat()[0] || 'متن، فایل یا مدل انتخاب‌شده نیاز به اصلاح دارد.')};
     if (status === 413) return {message: 'حجم فایل‌ها زیاد است. هر فایل حداکثر ۸ مگابایت و هر پیام حداکثر ۵ فایل باشد.'};
@@ -612,10 +612,35 @@ async function sendMessage() {
                 isFirstAssistantMessage = false;
                 clearMatchingDraft(request.text, request.conversationId);
                 clearMatchingDraft(request.text, request.originalConversationId);
-                showChatNotice([
+                const completionMessage = [
                     request.fallbackName ? 'پاسخ با مدل جایگزین «' + request.fallbackName + '» آماده شد.' : '',
                     request.contextTrimmed ? 'برای این پاسخ از بخش‌های اخیر مکالمه استفاده شد؛ سابقهٔ کامل محفوظ است.' : ''
-                ].filter(Boolean).join(' '));
+                ].filter(Boolean).join(' ');
+                if (data.free_question_used) {
+                    const remainingFree = Math.max(0, Number(data.remaining_free_questions || 0));
+                    const counter = document.getElementById('freeQuestionCounter');
+                    if (counter) counter.textContent = 'رایگان ' + remainingFree.toLocaleString('fa-IR');
+                    const banner = document.getElementById('freeTrialBanner');
+                    const bannerTitle = document.getElementById('freeTrialTitle');
+                    const bannerDescription = document.getElementById('freeTrialDescription');
+                    const accessUnlimited = data.free_access_unlimited === true;
+                    const remainingAccessDays = Math.max(0, Number(data.remaining_free_access_days || 0));
+                    const accessText = accessUnlimited ? 'مدت دسترسی نامحدود است.' : remainingAccessDays.toLocaleString('fa-IR') + ' روز از مدت دسترسی رایگان باقی مانده است.';
+                    if (banner) banner.hidden = false;
+                    if (remainingFree > 0) {
+                        if (bannerTitle) bannerTitle.textContent = remainingFree.toLocaleString('fa-IR') + ' سؤال رایگان برای امروز باقی مانده است';
+                        if (bannerDescription) bannerDescription.textContent = 'می‌توانید سؤال بعدی را بدون خرید اشتراک بپرسید. ' + accessText;
+                        showChatNotice('پاسخ رایگان آماده شد؛ هنوز ' + remainingFree.toLocaleString('fa-IR') + ' سؤال رایگان برای امروز دارید. ' + accessText);
+                    } else {
+                        if (bannerTitle) bannerTitle.textContent = 'سؤال‌های رایگان امروز استفاده شده‌اند';
+                        if (bannerDescription) bannerDescription.textContent = 'سهمیه روزانه امروز تمام شده است. ' + accessText + ' خرید اشتراک اختیاری است.';
+                        showChatNotice('پاسخ رایگان شما آماده شد و سهمیه امروز به پایان رسید. برای ادامه همین امروز می‌توانید اشتراک تهیه کنید.', 'info', {
+                            label: 'خرید اشتراک و ادامه', href: '/plans'
+                        });
+                    }
+                } else {
+                    showChatNotice(completionMessage);
+                }
             }
         });
         const reader = response.body.getReader();

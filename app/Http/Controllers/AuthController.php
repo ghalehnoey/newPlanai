@@ -76,12 +76,15 @@ class AuthController extends Controller
         Auth::login($user, $request->boolean('remember'));
 
         $active = method_exists($user, 'activeSubscription')
-            ? $user->activeSubscription()
-            : null;
+            ? $user->activeSubscription()->exists()
+            : false;
 
-        return $active
-            ? redirect()->route('home')
-            : redirect()->route('plans')->with('info', 'خوش آمدید! لطفاً یک پلن انتخاب کنید.');
+        return redirect()->route('home')->with(
+            'info',
+            $active
+                ? 'خوش آمدید.'
+                : 'خوش آمدید! امروز یک سؤال رایگان دارید؛ برای ادامه بیشتر می‌توانید اشتراک تهیه کنید.'
+        );
     }
 
     /* ----------------------------------------------------------
@@ -101,10 +104,31 @@ class AuthController extends Controller
         $request->merge(['phone' => $this->normalizeDigits($request->phone ?? '')]);
 
         $request->validate([
+            'phone' => ['required', 'string', 'max:20', 'regex:/^09\d{9}$/'],
+        ], [
+            'phone.regex' => 'شماره موبایل را به‌صورت 09XXXXXXXXX وارد کنید.',
+        ]);
+
+        // A duplicate registration is usually a returning user who has forgotten
+        // their password. Send them to the existing OTP recovery flow instead of
+        // leaving them at a validation dead-end. The SMS is sent only after the
+        // user presses the recovery button, preventing SMS abuse and surprise cost.
+        if (User::where('phone', $request->phone)->exists()) {
+            return redirect()
+                ->route('password.forgot')
+                ->with([
+                    'account_exists' => 'این شماره قبلاً ثبت شده است. برای ورود، با دریافت کد پیامکی یک رمز جدید تعیین کنید.',
+                    'recovery_phone' => $request->phone,
+                ]);
+        }
+
+        $request->validate([
             'name'     => 'required|string|max:255',
             'phone'    => 'required|string|max:20|unique:users,phone',
             'email'    => 'nullable|email|unique:users,email',
             'password' => 'required|min:6|confirmed',
+        ], [
+            'phone.unique' => 'این شماره قبلاً ثبت شده است. از گزینه بازیابی رمز عبور استفاده کنید.',
         ]);
 
         $user = User::create([
@@ -117,8 +141,8 @@ class AuthController extends Controller
 
         Auth::login($user);
 
-        return redirect()->route('plans')
-            ->with('info', 'ثبت‌نام با موفقیت انجام شد! لطفاً یک پلن انتخاب کنید.');
+        return redirect()->route('home')
+            ->with('info', 'ثبت‌نام با موفقیت انجام شد! اولین سؤال امروز شما رایگان است.');
     }
 
     /* ----------------------------------------------------------

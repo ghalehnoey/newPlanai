@@ -7,6 +7,7 @@ use App\Models\Message;
 use App\Models\UploadedFile;
 use App\Models\AiModel;
 use App\Models\AiUsageLog;
+use App\Models\User;
 use App\Services\AiApiService;            // برای تست می‌توانید این خط را تغییر دهید (پایین توضیح داده‌ام)
 use App\Services\ConversationService;
 use App\Services\ConversationMemoryService;
@@ -59,14 +60,16 @@ class ChatController extends BaseController
     {
         $requestId = (string) Str::uuid();
         $request->attributes->set('chat_request_id', $requestId);
-        $lock = null;
+        // One in-flight request per user prevents opening multiple tabs to bypass
+        // the daily free quota before its successful answer is accounted for.
+        $lock = Cache::lock('chat-send-user:' . auth()->id(), 300);
         $streamOwnsLock = false;
         try {
-            if ($request->filled('retry_message_id')) {
-                $lock = Cache::lock('chat-retry:' . auth()->id() . ':' . (int) $request->input('retry_message_id'), 300);
-                if (!$lock->get()) {
-                    return response()->json(['code' => 'request_in_progress', 'error' => 'همین پیام هنوز در حال پردازش است. کمی صبر کنید.'], 409);
-                }
+            if (!$lock->get()) {
+                return response()->json([
+                    'code' => 'request_in_progress',
+                    'error' => 'یک سؤال دیگر شما هنوز در حال پردازش است. کمی صبر کنید.',
+                ], 409);
             }
             $response = $this->processMessage($request);
             $response->headers->set('X-Request-Id', $requestId);
@@ -143,23 +146,22 @@ class ChatController extends BaseController
 
         if (!$user->canAskQuestion()) {
             $sub = $user->activeSubscription;
-            if (!$sub || !$sub->isActive()) {
+            if (!$user->hasFreeAccess() && (!$sub || $sub->remainingQuestions() <= 0)) {
                 $plansUrl = 'https://static.hakimisadr.com/plans';
-                $error = '<div style="line-height:1.8">'
-                    . '<span style="font-size:1.1em">سوال رایگان روزانه شما تمام شد.</span><br>'
-                    . '<span style="color:#555">فردا می‌توانید دوباره سوال رایگان بپرسید،</span><br>'
-                    . '<span style="color:#555">یا همین الان پلن تهیه کنید و بدون محدودیت ادامه دهید:</span><br><br>'
-                    . '<a href="' . $plansUrl . '" style="display:inline-block;background:#2563eb;color:#fff;padding:8px 20px;border-radius:8px;text-decoration:none;font-weight:bold;">'
-                    . 'مشاهده پلن‌ها و خرید اشتراک'
-                    . '</a>'
-                    . '</div>';
+                $error = 'مدت دسترسی رایگان شما به پایان رسیده است. برای ادامه می‌توانید اشتراک تهیه کنید.';
+            } elseif (!$sub || !$sub->isActive() || $sub->remainingQuestions() <= 0) {
+                $plansUrl = 'https://static.hakimisadr.com/plans';
+                $error = 'سؤال رایگان امروز شما استفاده شده است. فردا دوباره یک سؤال رایگان دارید؛ برای ادامه همین حالا اشتراک تهیه کنید.';
             } else {
                 $plansUrl = 'https://static.hakimisadr.com/plans';
-                $error = '<a href="' . $plansUrl . '" style="color:#e63946;font-weight:bold;text-decoration:underline;">برای ادامه چت کلیک کنید</a><br>'
-                    . '<span style="color:#000">سؤالات مجاز اشتراک شما تمام شده</span><br>'
-                    . '<span style="color:#000">وب سایت دکتر حکیمی صدر</span>';
+                $error = 'سؤالات مجاز اشتراک شما تمام شده است. برای ادامه، اشتراک خود را تمدید یا ارتقا دهید.';
             }
-            return response()->json(['code' => 'quota_exceeded', 'error' => $error], 403);
+            return response()->json([
+                'code' => 'quota_exceeded',
+                'error' => $error,
+                'message' => $error,
+                'upgrade_url' => $plansUrl,
+            ], 403);
         }
 
         $preparedFileTexts = [];
@@ -332,7 +334,11 @@ class ChatController extends BaseController
         }
 
         $subscription = $user->activeSubscription;
-        $isFreeQuestion = !$subscription && $user->canUseFreeQuestion();
+        $hasSubscriptionQuota = $subscription && $subscription->remainingQuestions() > 0;
+        $isFreeQuestion = !$hasSubscriptionQuota && $user->canUseFreeQuestion();
+        if (!$hasSubscriptionQuota) {
+            $subscription = null;
+        }
 
         $protocolV2 = $request->header('X-Chat-Protocol') === '2';
         $requestId = $request->attributes->get('chat_request_id');
@@ -456,7 +462,20 @@ class ChatController extends BaseController
                     }
                     return $answer;
                 });
-                $emit('done', ['message_id' => $answer->id, 'conversation_id' => (string) $conversation->id]);
+                $remainingFreeQuestions = $isFreeQuestion
+                    ? $user->fresh()->remainingFreeQuestions()
+                    : null;
+                $remainingFreeAccessDays = $isFreeQuestion
+                    ? $user->fresh()->remainingFreeAccessDays()
+                    : null;
+                $emit('done', [
+                    'message_id' => $answer->id,
+                    'conversation_id' => (string) $conversation->id,
+                    'free_question_used' => $isFreeQuestion,
+                    'remaining_free_questions' => $remainingFreeQuestions,
+                    'remaining_free_access_days' => $remainingFreeAccessDays,
+                    'free_access_unlimited' => $isFreeQuestion && User::freeAccessDurationDays() === 0,
+                ]);
             } catch (\Throwable $error) {
                 ChatReliability::report($error, [
                     'request_id' => $requestId, 'model' => $modelKey,

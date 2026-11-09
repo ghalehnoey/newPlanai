@@ -40,6 +40,13 @@
 
     <div class="auth-card">
 
+        @if(session('account_exists'))
+        <div style="background:#eef2ff;border:1px solid #c7d2fe;color:#3730a3;padding:13px 14px;border-radius:10px;font-size:13px;line-height:1.9;margin-bottom:18px;">
+            <strong style="display:block;margin-bottom:2px;">حساب شما پیدا شد</strong>
+            {{ session('account_exists') }}
+        </div>
+        @endif
+
         @if($errors->any())
         <div style="background:#fef2f2;border:1px solid #fecaca;color:#dc2626;padding:12px 14px;border-radius:10px;font-size:13px;margin-bottom:18px;">
             {{ $errors->first() }}
@@ -50,10 +57,10 @@
             @csrf
             <div style="margin-bottom:20px;">
                 <label style="display:block;font-size:13px;font-weight:600;color:#374151;margin-bottom:6px;">شماره موبایل ثبت‌شده</label>
-                <input type="text" name="phone" required class="input-field" placeholder="09XXXXXXXXX" dir="ltr" value="{{ old('phone') }}">
+                <input type="text" name="phone" required class="input-field" placeholder="09XXXXXXXXX" dir="ltr" inputmode="numeric" autocomplete="tel" maxlength="11" value="{{ old('phone', $phone ?? '') }}">
                 <p style="font-size:12px;color:#94a3b8;margin-top:6px;margin-bottom:0;">کد ۶ رقمی به این شماره ارسال می‌شود</p>
             </div>
-            <button type="submit" class="btn-primary">ارسال کد بازیابی</button>
+            <button type="submit" class="btn-primary">ارسال کد و تعیین رمز جدید</button>
         </form>
 
         <div style="margin-top:20px;text-align:center;font-size:13px;color:#64748b;">

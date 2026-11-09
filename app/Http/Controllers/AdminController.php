@@ -760,6 +760,10 @@ class AdminController extends Controller
         $dailyFreeQuestions = (int) DB::table('settings')
             ->where('key', 'daily_free_questions')
             ->value('value') ?? 1;
+        $storedFreeAccessDuration = DB::table('settings')
+            ->where('key', 'free_access_duration_days')
+            ->value('value');
+        $freeAccessDurationDays = $storedFreeAccessDuration === null ? 0 : max(0, (int) $storedFreeAccessDuration);
         $usdToTomanRate = (float) DB::table('settings')
             ->where('key', 'usd_to_toman_rate')
             ->value('value') ?? 0;
@@ -783,7 +787,7 @@ class AdminController extends Controller
             ->first();
 
         return view('admin.system', compact(
-            'dailyFreeQuestions', 'usdToTomanRate', 'aiDailyBudgetUsd', 'memorySettings', 'memoryStats',
+            'dailyFreeQuestions', 'freeAccessDurationDays', 'usdToTomanRate', 'aiDailyBudgetUsd', 'memorySettings', 'memoryStats',
             'smartRoutingSettings', 'smartRoutingModel', 'smartRoutingStats',
         ));
     }
@@ -796,6 +800,7 @@ class AdminController extends Controller
     {
         $request->validate([
             'daily_free_questions' => 'nullable|integer|min:0|max:100',
+            'free_access_duration_days' => 'nullable|integer|min:0|max:36500',
             'ai_history_message_limit' => 'nullable|integer|min:0|max:80',
             'usd_to_toman_rate' => 'nullable|numeric|min:0|max:100000000',
             'ai_daily_budget_usd' => 'nullable|numeric|min:0|max:1000000',
@@ -813,7 +818,7 @@ class AdminController extends Controller
             'ai_smart_routing_max_characters' => 'nullable|integer|min:200|max:4000',
         ]);
         if (!$request->hasAny(array_merge(
-            ['daily_free_questions', 'ai_history_message_limit', 'usd_to_toman_rate', 'ai_daily_budget_usd'],
+            ['daily_free_questions', 'free_access_duration_days', 'ai_history_message_limit', 'usd_to_toman_rate', 'ai_daily_budget_usd'],
             ConversationMemoryService::SETTING_KEYS,
             SmartModelRouter::SETTING_KEYS,
         ))) {
@@ -826,6 +831,12 @@ class AdminController extends Controller
                 ['value' => $request->daily_free_questions, 'updated_at' => now()]
             );
             Cache::forget('daily_free_questions');
+        }
+        if ($request->filled('free_access_duration_days') || $request->input('free_access_duration_days') === '0') {
+            DB::table('settings')->updateOrInsert(
+                ['key' => 'free_access_duration_days'],
+                ['value' => (string) (int) $request->free_access_duration_days, 'updated_at' => now()]
+            );
         }
         if ($request->filled('ai_history_message_limit') || $request->input('ai_history_message_limit') === '0') {
             DB::table('settings')->updateOrInsert(
